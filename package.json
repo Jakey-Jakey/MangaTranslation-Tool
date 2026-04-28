@@ -1,0 +1,30 @@
+{
+  "name": "mangatranslator",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Local-first manga translation workspace with a React/Vite frontend and OpenRouter-powered translation chat.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5173",
+    "server": "node --no-warnings server/index.cjs",
+    "start": "node --no-warnings server/index.cjs",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "test:smoke": "node scripts/smoke-test.cjs"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "@openrouter/sdk": "latest",
+    "jszip": "latest",
+    "sharp": "latest"
+  },
+  "devDependencies": {
+    "playwright": "^1.59.1"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

@@ -1,0 +1,234 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>MangaTranslator — design exploration</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@400;500&family=Noto+Serif+JP:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles/tokens.css" />
+  <link rel="stylesheet" href="styles/app.css" />
+  <style>
+    html, body, #root { height: 100%; margin: 0; background: #08090B; }
+    body { font-family: "Inter Tight", system-ui, sans-serif; color: #E6E8EC; }
+
+    /* tweak panel */
+    .tweaks {
+      position: fixed; bottom: 14px; right: 14px; z-index: 100;
+      width: 280px; background: #15171B; color: #E6E8EC;
+      border: 1px solid #262A31; border-radius: 12px;
+      box-shadow: 0 18px 48px rgba(0,0,0,.55);
+      font-family: "Inter Tight", system-ui, sans-serif;
+      font-size: 12px; overflow: hidden;
+    }
+    .tweaks .hd { padding: 10px 12px; border-bottom: 1px solid #262A31; display: flex; align-items: center; justify-content: space-between; font-weight: 600; font-size: 12px; letter-spacing: .04em; text-transform: uppercase; color: #A7ADB8; }
+    .tweaks .row { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; gap: 8px; }
+    .tweaks .row + .row { border-top: 1px solid #1F2228; }
+    .tweaks .row label { color: #A7ADB8; font-size: 11.5px; }
+    .tweaks .segs { display: flex; gap: 2px; background: #1C1F24; padding: 2px; border-radius: 6px; }
+    .tweaks .segs button { padding: 3px 8px; font-size: 10.5px; color: #A7ADB8; border-radius: 4px; border: 0; background: transparent; cursor: pointer; }
+    .tweaks .segs button[aria-pressed="true"] { background: #0E1012; color: #E6E8EC; }
+    .tweaks .swatches { display: flex; gap: 4px; }
+    .tweaks .swatches button { width: 18px; height: 18px; border-radius: 4px; border: 1.5px solid transparent; cursor: pointer; padding: 0; }
+    .tweaks .swatches button[aria-pressed="true"] { border-color: #E6E8EC; }
+    .tweaks .tog { width: 28px; height: 16px; background: #2C3038; border-radius: 8px; position: relative; cursor: pointer; border: 0; padding: 0; }
+    .tweaks .tog[aria-pressed="true"] { background: var(--accent-tog, #FF5A3C); }
+    .tweaks .tog::after { content:""; width: 12px; height: 12px; border-radius: 50%; background: #fff; position: absolute; top: 2px; left: 2px; transition: left .15s ease; }
+    .tweaks .tog[aria-pressed="true"]::after { left: 14px; }
+    .tweaks .foot { padding: 10px 12px; border-top: 1px solid #262A31; display: flex; align-items: center; gap: 6px; font-size: 10.5px; color: #727883; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+  <script type="text/babel" src="design-canvas.jsx"></script>
+  <script type="text/babel" src="components/Icon.jsx"></script>
+  <script type="text/babel" src="components/MangaPages.jsx"></script>
+  <script type="text/babel" src="components/Chrome.jsx"></script>
+  <script type="text/babel" src="components/Onboarding.jsx"></script>
+  <script type="text/babel" src="components/PageStrip.jsx"></script>
+  <script type="text/babel" src="components/Viewer.jsx"></script>
+  <script type="text/babel" src="components/ChatPanel.jsx"></script>
+  <script type="text/babel" src="components/Workbench.jsx"></script>
+  <script type="text/babel" src="components/Modals.jsx"></script>
+  <script type="text/babel" src="components/App.jsx"></script>
+
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+
+    const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{
+      "theme": "dark",
+      "accent": "#FF5A3C",
+      "density": "balanced",
+      "showOverlays": true,
+      "sampleIndex": 0
+    }/*EDITMODE-END*/;
+
+    const ACCENTS = [
+      { v: "#FF5A3C", label: "Persimmon" },
+      { v: "#7C5CFF", label: "Iris" },
+      { v: "#4CC38A", label: "Matcha" },
+      { v: "#6BA6FF", label: "Cerulean" },
+      { v: "#E8B84A", label: "Sumi-gold" },
+    ];
+
+    function App() {
+      const [t, setT] = useState(() => {
+        try { return { ...TWEAK_DEFAULTS, ...JSON.parse(localStorage.getItem("mt-tweaks") || "{}") }; }
+        catch { return TWEAK_DEFAULTS; }
+      });
+      const [editMode, setEditMode] = useState(false);
+      const [focus, setFocus] = useState(null); // null | "dark" | "paper"
+
+      const set = (k, v) => {
+        const next = { ...t, [k]: v };
+        setT(next);
+        localStorage.setItem("mt-tweaks", JSON.stringify(next));
+        window.parent.postMessage({ type: "__edit_mode_set_keys", edits: { [k]: v } }, "*");
+      };
+
+      useEffect(() => {
+        const onMsg = (e) => {
+          if (!e.data || typeof e.data !== "object") return;
+          if (e.data.type === "__activate_edit_mode") setEditMode(true);
+          if (e.data.type === "__deactivate_edit_mode") setEditMode(false);
+        };
+        window.addEventListener("message", onMsg);
+        window.parent.postMessage({ type: "__edit_mode_available" }, "*");
+        return () => window.removeEventListener("message", onMsg);
+      }, []);
+
+      const sharedProps = {
+        accent: t.accent, density: t.density,
+        showOverlays: t.showOverlays, pageIndex: t.sampleIndex,
+      };
+
+      return (
+        <>
+          <DesignCanvas title="MangaTranslator — Desktop" subtitle="Translation mode, onboarding flow, all menus and modals. Click any card's arrow to focus.">
+            <DCSection id="main" title="Translation workspace">
+              <DCArtboard id="translation" label="Translation mode" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} />
+              </DCArtboard>
+            </DCSection>
+
+            <DCSection id="onboarding" title="First-launch onboarding — full flow">
+              <DCArtboard id="onb-step0" label="Step 0 · Connect OpenRouter" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} showOnboarding={true} onboardingStep={0} />
+              </DCArtboard>
+              <DCArtboard id="onb-step1" label="Step 1 · Workspace folder" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} showOnboarding={true} onboardingStep={1} />
+              </DCArtboard>
+              <DCArtboard id="onb-step2" label="Step 2 · Import project" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} showOnboarding={true} onboardingStep={2} />
+              </DCArtboard>
+            </DCSection>
+
+            <DCSection id="model-picker" title="Model picker">
+              <DCArtboard id="model" label="Model picker · searchable, vision-filtered" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="model" />
+              </DCArtboard>
+            </DCSection>
+
+            <DCSection id="settings" title="Settings — all tabs">
+              <DCArtboard id="set-prompt" label="System prompt" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="settings" settingsTab="prompt" />
+              </DCArtboard>
+              <DCArtboard id="set-languages" label="Languages" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="settings" settingsTab="languages" />
+              </DCArtboard>
+              <DCArtboard id="set-workspace" label="Workspace" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="settings" settingsTab="workspace" />
+              </DCArtboard>
+              <DCArtboard id="set-images" label="Image quality" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="settings" settingsTab="images" />
+              </DCArtboard>
+              <DCArtboard id="set-account" label="Account" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="settings" settingsTab="account" />
+              </DCArtboard>
+              <DCArtboard id="set-shortcuts" label="Shortcuts" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="settings" settingsTab="shortcuts" />
+              </DCArtboard>
+            </DCSection>
+
+            <DCSection id="export" title="Export dialog">
+              <DCArtboard id="export-modal" label="Markdown / JSON / CSV export" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="export" />
+              </DCArtboard>
+            </DCSection>
+
+            <DCSection id="decisions" title="Project decisions — translation memory">
+              <DCArtboard id="decisions-modal" label="Names · honorifics · recurring terms · tone" width={1560} height={960}>
+                <MangaTranslator {...sharedProps} theme={t.theme} openModal="decisions" />
+              </DCArtboard>
+            </DCSection>
+
+            <DCSection id="typesetting" title="Typesetting placeholder">
+              <DCArtboard id="type-dark" label="Mode 2 · coming soon" width={1560} height={720}>
+                <MangaTranslator {...sharedProps} theme={t.theme} startMode="typesetting" />
+              </DCArtboard>
+            </DCSection>
+          </DesignCanvas>
+
+          {editMode && (
+            <div className="tweaks" style={{ "--accent-tog": t.accent }}>
+              <div className="hd">
+                <span>Tweaks</span>
+                <span style={{ fontSize: 10, color: "#727883", textTransform: "none", letterSpacing: 0 }}>live</span>
+              </div>
+              <div className="row">
+                <label>Theme</label>
+                <div className="segs" role="tablist">
+                  {["dark", "light"].map(v => (
+                    <button key={v} aria-pressed={t.theme === v} onClick={() => set("theme", v)}>{v}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="row">
+                <label>Accent</label>
+                <div className="swatches">
+                  {ACCENTS.map(a => (
+                    <button key={a.v} title={a.label} style={{ background: a.v }} aria-pressed={t.accent === a.v} onClick={() => set("accent", a.v)} />
+                  ))}
+                </div>
+              </div>
+              <div className="row">
+                <label>Density</label>
+                <div className="segs">
+                  {["airy", "balanced", "dense"].map(v => (
+                    <button key={v} aria-pressed={t.density === v} onClick={() => set("density", v)}>{v}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="row">
+                <label>Sample page</label>
+                <div className="segs">
+                  {[0, 1, 2].map(i => (
+                    <button key={i} aria-pressed={t.sampleIndex === i} onClick={() => set("sampleIndex", i)}>p.{String(i + 1).padStart(2, "0")}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="row">
+                <label>Crop overlays</label>
+                <button className="tog" aria-pressed={t.showOverlays} onClick={() => set("showOverlays", !t.showOverlays)} />
+              </div>
+              <div className="foot">Toggle Tweaks in the toolbar to hide this panel.</div>
+            </div>
+          )}
+        </>
+      );
+    }
+
+    // unused legacy helper — kept for reference
+    function TypesettingOpener() {
+      return null;
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
