@@ -97,6 +97,7 @@ svg { flex: 0 0 auto; }
 .btn.ghost { background: transparent; border-color: transparent; color: var(--fg-2); }
 .btn.ghost:hover:not(:disabled) { background: var(--bg-2); color: var(--fg-1); }
 .btn.primary { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+.btn.danger { background: var(--danger); color: white; border-color: transparent; }
 .btn.sm { min-height: 24px; padding: 0 8px; font-size: 11px; }
 .btn.icon { width: var(--row-h); padding: 0; }
 .btn.icon.sm { width: 24px; }
@@ -134,9 +135,12 @@ button.pill.active, .pill.active { color: var(--accent); border-color: color-mix
 .translation-layout {
   min-height: 0;
   display: grid;
-  grid-template-columns: auto minmax(360px, 1fr) 340px 360px;
+  grid-template-columns: auto minmax(360px, 1fr) 6px var(--workbench-w, 340px) 6px var(--chat-w, 360px);
   overflow: hidden;
 }
+.translation-layout.resizing { cursor: col-resize; user-select: none; }
+.splitter { min-width: 0; background: var(--bg-0); border-left: 1px solid var(--line); border-right: 1px solid var(--line); cursor: col-resize; }
+.splitter:hover, .splitter:focus-visible { background: color-mix(in oklab, var(--accent) 24%, var(--bg-0)); outline: none; }
 .page-strip {
   width: 152px;
   min-height: 0;
@@ -294,11 +298,12 @@ button.pill.active, .pill.active { color: var(--accent); border-color: color-mix
 .language-row select { height: 24px; width: auto; background: var(--bg-2); border: 1px solid var(--line); border-radius: 5px; color: var(--fg-1); font-size: 11px; }
 .reasoning-select { display: inline-flex; align-items: center; gap: 5px; min-width: 0; color: var(--fg-3); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; font-weight: 800; }
 .reasoning-select select { width: 82px; text-transform: none; letter-spacing: 0; font-weight: 700; }
-.chat-pass-row { display: grid; grid-template-columns: auto minmax(0,1fr) auto auto auto; gap: 6px; align-items: center; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+.chat-pass-row { display: grid; grid-template-columns: auto minmax(0,1fr) repeat(5, auto); gap: 6px; align-items: center; padding: 9px 12px; border-bottom: 1px solid var(--line); }
 .chat-pass-row > span { color: var(--fg-3); font-size: 10px; text-transform: uppercase; letter-spacing: .08em; font-weight: 800; }
 .chat-pass-row select { min-width: 0; height: 30px; border: 1px solid var(--line); border-radius: 7px; background: var(--bg-2); color: var(--fg-1); padding: 0 8px; }
 .chat-session-editor { min-width: 0; display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 4px; }
 .chat-session-editor input { min-width: 0; min-height: 30px; border: 1px solid var(--accent); border-radius: 7px; background: var(--bg-2); color: var(--fg-1); padding: 4px 8px; outline: none; }
+.template-row { display: flex; gap: 4px; flex-wrap: wrap; padding: 7px 12px; border-bottom: 1px solid var(--line); }
 .model-select { max-width: 100%; min-width: 0; justify-content: flex-start; border-color: var(--line); background: var(--bg-2); }
 .model-select:hover { border-color: color-mix(in oklab, var(--accent) 45%, var(--line)); color: var(--fg-1); }
 .model-select svg { flex: 0 0 auto; }
@@ -320,6 +325,8 @@ button.pill.active, .pill.active { color: var(--accent); border-color: color-mix
 .message-meta time { color: var(--fg-4); letter-spacing: 0; }
 .message-attachments { display: flex; flex-wrap: wrap; gap: 5px; }
 .message-attachments span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-3); background: var(--bg-2); border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; font-size: 10px; }
+.translation-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 7px 8px; border: 1px solid color-mix(in oklab, var(--accent) 24%, var(--line)); border-radius: 7px; background: var(--accent-soft); }
+.translation-actions span { color: var(--fg-2); font-size: 11px; font-weight: 650; }
 .message-bubble { margin: 0; white-space: pre-wrap; font: 12.5px/1.5 var(--font-sans); color: var(--fg-1); background: var(--bg-2); border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
 .message-bubble.pending { color: var(--fg-3); }
 .message.user .message-bubble { background: var(--accent-soft); border-color: color-mix(in oklab, var(--accent) 26%, transparent); border-radius: 12px 12px 3px 12px; }
@@ -413,8 +420,9 @@ button.pill.active, .pill.active { color: var(--accent); border-color: color-mix
 .projects-modal h3 { margin: 0 0 10px; }
 .projects-modal section { display: grid; align-content: start; gap: 10px; min-width: 0; }
 .project-list { display: grid; gap: 8px; }
-.project-list button { display: grid; gap: 3px; text-align: left; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-2); }
-.project-list button.active { border-color: var(--accent); background: var(--accent-soft); }
+.project-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 6px; align-items: center; padding: 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg-2); }
+.project-row.active { border-color: var(--accent); background: var(--accent-soft); }
+.project-row > button:first-child { min-width: 0; display: grid; gap: 3px; text-align: left; padding: 4px; border: 0; background: transparent; }
 .project-list span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg-3); font-family: var(--font-mono); font-size: 11px; }
 
 .typesetting { display: grid; place-items: center; align-content: center; gap: 14px; padding: 40px; text-align: center; }
@@ -432,6 +440,13 @@ button.pill.active, .pill.active { color: var(--accent); border-color: color-mix
 .mt-scroll::-webkit-scrollbar-thumb:hover { background: var(--bg-4); background-clip: padding-box; border: 2px solid transparent; }
 
 @media (max-width: 1180px) {
-  .translation-layout { grid-template-columns: auto minmax(300px, 1fr) 320px; }
-  .chat-panel { display: none; }
+  .translation-layout { grid-template-columns: auto minmax(300px, 1fr) 6px minmax(300px, 42vw); }
+  .translation-layout > .splitter:last-of-type, .chat-panel { display: none; }
+}
+
+@media (max-width: 860px) {
+  .translation-layout { grid-template-columns: minmax(0, 1fr); overflow-y: auto; }
+  .page-strip, .splitter { display: none; }
+  .viewer-panel, .workbench, .chat-panel { min-height: 60vh; border-left: 0; border-top: 1px solid var(--line); }
+  .chat-panel { display: flex; }
 }

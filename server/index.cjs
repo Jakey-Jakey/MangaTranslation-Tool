@@ -74,6 +74,22 @@ function slugify(value) { return String(value || "Project").trim().toLowerCase()
 function sortByName(a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: "base" }); }
 function extOf(name) { return path.extname(name || "").toLowerCase(); }
 function cleanName(name) { return path.basename(String(name || "page")).replace(/[^\w .()[\]-]+/g, "_"); }
+function bufferHash(buffer) { return crypto.createHash("sha1").update(buffer).digest("hex"); }
+function requireString(body, key, label = key) {
+  const value = String(body?.[key] || "").trim();
+  if (!value) throw statusError(422, `${label} is required.`);
+  return value;
+}
+function optionalString(body, key, max = 10000) {
+  return String(body?.[key] ?? "").slice(0, max);
+}
+function optionalEnum(value, allowed, fallback) {
+  return allowed.includes(value) ? value : fallback;
+}
+function parseBodyObject(body, label = "Request body") {
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw statusError(422, `${label} must be an object.`);
+  return body;
+}
 
 async function readJson(file, fallback) {
   try { return JSON.parse(await fsp.readFile(file, "utf8")); } catch { return fallback; }
@@ -171,6 +187,7 @@ function openDb(projectDir) {
       file_name TEXT NOT NULL,
       original_path TEXT NOT NULL,
       workspace_path TEXT NOT NULL,
+      content_hash TEXT,
       order_index INTEGER NOT NULL,
       width INTEGER,
       height INTEGER,
@@ -194,6 +211,7 @@ function openDb(projectDir) {
     CREATE TABLE IF NOT EXISTS scratchpad_entries (
       id TEXT PRIMARY KEY,
       page_id TEXT NOT NULL,
+      translation_entry_id TEXT,
       label TEXT NOT NULL,
       type TEXT,
       source TEXT,
@@ -222,6 +240,25 @@ function openDb(projectDir) {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS translation_entries (
+      id TEXT PRIMARY KEY,
+      page_id TEXT NOT NULL,
+      chat_session_id TEXT,
+      chat_message_id TEXT,
+      scratchpad_entry_id TEXT,
+      label TEXT NOT NULL,
+      type TEXT NOT NULL,
+      source TEXT,
+      draft TEXT,
+      final TEXT,
+      notes TEXT,
+      confidence REAL,
+      crop_ids_json TEXT NOT NULL DEFAULT '[]',
+      model TEXT,
+      sort_order INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS settings (
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
@@ -241,7 +278,10 @@ function openDb(projectDir) {
 function migrateDb(db) {
   const chatColumns = db.prepare("PRAGMA table_info(chat_messages)").all().map((column) => column.name);
   if (!chatColumns.includes("session_id")) db.exec("ALTER TABLE chat_messages ADD COLUMN session_id TEXT");
+  const pageColumns = db.prepare("PRAGMA table_info(pages)").all().map((column) => column.name);
+  if (!pageColumns.includes("content_hash")) db.exec("ALTER TABLE pages ADD COLUMN content_hash TEXT");
   const scratchpadColumns = db.prepare("PRAGMA table_info(scratchpad_entries)").all().map((column) => column.name);
+  if (!scratchpadColumns.includes("translation_entry_id")) db.exec("ALTER TABLE scratchpad_entries ADD COLUMN translation_entry_id TEXT");
   if (!scratchpadColumns.includes("confirmed")) {
     db.exec("ALTER TABLE scratchpad_entries ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0");
     db.exec("UPDATE scratchpad_entries SET confirmed = 1 WHERE TRIM(COALESCE(final, '')) != ''");
@@ -351,7 +391,16 @@ function getMessages(db, pageId) {
 }
 
 function getSessionMessages(db, sessionId) {
-  return db.prepare("SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at").all(sessionId || "");
+  const messages = db.prepare("SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at").all(sessionId || "");
+  const entriesByMessage = new Map();
+  db.prepare("SELECT * FROM translation_entries WHERE chat_session_id = ? ORDER BY sort_order, label").all(sessionId || "").forEach((entry) => {
+    if (!entriesByMessage.has(entry.chat_message_id)) entriesByMessage.set(entry.chat_message_id, []);
+    entriesByMessage.get(entry.chat_message_id).push(entry);
+  });
+  return messages.map((message) => {
+    const entries = entriesByMessage.get(message.id) || [];
+    return entries.length ? { ...message, translation_entries_json: JSON.stringify(entries) } : message;
+  });
 }
 
 function getChatSessions(db, pageId) {
@@ -470,21 +519,43 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/workspace/setup") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    body.workspaceRoot = optionalString(body, "workspaceRoot", 4096);
+    body.projectName = optionalString(body, "projectName", 160) || "Untitled Project";
+    body.importMode = optionalEnum(body.importMode, ["copy", "inplace"], "copy");
     const project = await createOrOpenProject(body);
     return sendJson(res, { project });
   }
 
   if (req.method === "POST" && url.pathname === "/api/projects/open") {
-    const body = await parseJson(req, 1024 * 64);
+    const body = parseBodyObject(await parseJson(req, 1024 * 64));
+    const slug = requireString(body, "slug", "Project slug");
     const config = await getConfig();
     if (!config.workspaceRoot) throw statusError(409, "No workspace root selected.");
     const projects = await getProjects(config.workspaceRoot);
-    const project = projects.find((item) => item.slug === body.slug);
+    const project = projects.find((item) => item.slug === slug);
     if (!project) throw statusError(404, "Project not found.");
     config.activeProjectSlug = project.slug;
     await saveConfig(config);
     return sendJson(res, { project });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/projects/delete") {
+    const body = parseBodyObject(await parseJson(req, 1024 * 64));
+    const slug = requireString(body, "slug", "Project slug");
+    const config = await getConfig();
+    if (!config.workspaceRoot) throw statusError(409, "No workspace root selected.");
+    const projects = await getProjects(config.workspaceRoot);
+    const project = projects.find((item) => item.slug === slug);
+    if (!project) throw statusError(404, "Project not found.");
+    const workspaceRoot = path.resolve(config.workspaceRoot);
+    const target = path.resolve(project.path);
+    if (target === workspaceRoot || !target.startsWith(`${workspaceRoot}${path.sep}`)) throw statusError(403, "Refusing to delete a path outside the workspace.");
+    await fsp.rm(target, { recursive: true, force: true });
+    const remaining = await getProjects(config.workspaceRoot);
+    if (config.activeProjectSlug === slug) config.activeProjectSlug = remaining[0]?.slug || "";
+    await saveConfig(config);
+    return sendJson(res, { projects: remaining, activeProject: remaining.find((item) => item.slug === config.activeProjectSlug) || null });
   }
 
   if (req.method === "GET" && url.pathname === "/api/page") {
@@ -518,7 +589,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/settings") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
     return withProject(({ db }) => {
       Object.entries(body).forEach(([key, value]) => upsertSetting(db, key, value));
       return sendJson(res, { settings: getSettings(db) });
@@ -526,23 +597,25 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/import/files") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    if (!Array.isArray(body.files)) throw statusError(422, "files must be an array.");
     return withProject(async ({ project, db }) => {
-      const imported = await importUploadedFiles(db, project.path, body.files || []);
+      const imported = await importUploadedFiles(db, project.path, body.files);
       return sendJson(res, { imported, pages: getPages(db) });
     });
   }
 
   if (req.method === "POST" && url.pathname === "/api/import/path") {
-    const body = await parseJson(req, 1024 * 64);
+    const body = parseBodyObject(await parseJson(req, 1024 * 64));
+    const sourcePath = requireString(body, "path", "Import path");
     return withProject(async ({ project, db }) => {
-      const imported = await importLocalPath(db, project.path, path.resolve(expandHome(body.path)));
+      const imported = await importLocalPath(db, project.path, path.resolve(expandHome(sourcePath)));
       return sendJson(res, { imported, pages: getPages(db) });
     });
   }
 
   if (req.method === "POST" && url.pathname === "/api/crops") {
-    const body = await parseJson(req);
+    const body = parseCropBody(parseBodyObject(await parseJson(req)), true);
     return withProject(async ({ project, db }) => {
       const crop = await createCrop(db, project.path, body);
       return sendJson(res, { crop, crops: getCrops(db, body.pageId), queue: getQueue(db, body.pageId) });
@@ -550,7 +623,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/crops/update") {
-    const body = await parseJson(req);
+    const body = parseCropBody(parseBodyObject(await parseJson(req)), false);
     return withProject(async ({ project, db }) => {
       const crop = await updateCrop(db, project.path, body);
       return sendJson(res, { crop, crops: getCrops(db, crop.page_id), queue: getQueue(db, crop.page_id) });
@@ -558,7 +631,8 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/crops/remove") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    body.cropId = requireString(body, "cropId", "Crop id");
     return withProject(async ({ project, db }) => {
       const crop = db.prepare("SELECT * FROM crops WHERE id = ?").get(body.cropId);
       if (!crop) throw statusError(404, "Crop not found.");
@@ -569,7 +643,9 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/queue") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    body.cropId = requireString(body, "cropId", "Crop id");
+    body.action = optionalEnum(body.action, ["add", "remove"], "add");
     return withProject(({ db }) => {
       const crop = db.prepare("SELECT * FROM crops WHERE id = ?").get(body.cropId);
       if (!crop) throw statusError(404, "Crop not found.");
@@ -585,7 +661,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/queue/reorder") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
     return withProject(({ db }) => {
       const ids = Array.isArray(body.cropIds) ? body.cropIds.filter(Boolean) : [];
       if (!ids.length) throw statusError(422, "No queued crops supplied.");
@@ -607,7 +683,8 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/queue/all") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    body.pageId = requireString(body, "pageId", "Page id");
     return withProject(({ db }) => {
       const crops = getCrops(db, body.pageId);
       crops.forEach((crop, index) => db.prepare("UPDATE crops SET queued = 1, queue_order = ? WHERE id = ?").run(index + 1, crop.id));
@@ -616,7 +693,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/scratchpad") {
-    const body = await parseJson(req);
+    const body = parseScratchpadBody(parseBodyObject(await parseJson(req)));
     return withProject(({ db }) => {
       const entry = upsertScratchpad(db, body);
       return sendJson(res, { entry, page: getPage(db, body.pageId), scratchpad: getScratchpad(db, body.pageId) });
@@ -624,7 +701,8 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/scratchpad/remove") {
-    const body = await parseJson(req, 1024 * 64);
+    const body = parseBodyObject(await parseJson(req, 1024 * 64));
+    body.entryId = requireString(body, "entryId", "Scratchpad entry id");
     return withProject(({ db }) => {
       const entry = db.prepare("SELECT page_id FROM scratchpad_entries WHERE id = ?").get(body.entryId);
       if (!entry) throw statusError(404, "Scratchpad entry not found.");
@@ -634,7 +712,8 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/decisions") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    if (!Array.isArray(body.decisions)) throw statusError(422, "decisions must be an array.");
     return withProject(({ db }) => {
       db.prepare("DELETE FROM decisions").run();
       const insert = db.prepare("INSERT INTO decisions (id, category, term, rule, sort_order) VALUES (?, ?, ?, ?, ?)");
@@ -644,7 +723,8 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/chat/clear") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    body.scope = optionalEnum(body.scope, ["page", "project", "session"], "page");
     return withProject(({ db }) => {
       if (body.scope === "project") db.prepare("DELETE FROM chat_messages").run();
       else if (body.sessionId) db.prepare("DELETE FROM chat_messages WHERE session_id = ?").run(body.sessionId);
@@ -656,7 +736,8 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/chat/session") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    body.pageId = requireString(body, "pageId", "Page id");
     return withProject(({ db }) => {
       const now = nowIso();
       const sessionId = id("chat");
@@ -668,7 +749,9 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/chat/session/select") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    body.pageId = requireString(body, "pageId", "Page id");
+    body.sessionId = requireString(body, "sessionId", "Chat session id");
     return withProject(({ db }) => {
       const session = ensureChatSession(db, body.pageId || "", body.sessionId || "");
       touchChatSession(db, session.id);
@@ -677,11 +760,41 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/chat/session/rename") {
-    const body = await parseJson(req);
+    const body = parseBodyObject(await parseJson(req));
+    body.sessionId = requireString(body, "sessionId", "Chat session id");
     return withProject(({ db }) => {
       const session = touchChatSession(db, body.sessionId, String(body.title || "").trim().slice(0, 80) || "Translation pass");
       if (!session) throw statusError(404, "Chat session not found.");
       return sendJson(res, { chatSessions: getChatSessions(db, session.page_id || ""), activeChatSessionId: session.id, messages: getSessionMessages(db, session.id) });
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/chat/session/archive") {
+    const body = parseBodyObject(await parseJson(req));
+    body.sessionId = requireString(body, "sessionId", "Chat session id");
+    return withProject(({ db }) => {
+      const session = db.prepare("SELECT * FROM chat_sessions WHERE id = ?").get(body.sessionId);
+      if (!session) throw statusError(404, "Chat session not found.");
+      db.prepare("UPDATE chat_sessions SET status = 'archived', updated_at = ? WHERE id = ?").run(nowIso(), session.id);
+      const active = ensureChatSession(db, session.page_id || "");
+      return sendJson(res, { chatSessions: getChatSessions(db, session.page_id || ""), activeChatSessionId: active.id, messages: getSessionMessages(db, active.id) });
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/chat/session/delete") {
+    const body = parseBodyObject(await parseJson(req));
+    body.sessionId = requireString(body, "sessionId", "Chat session id");
+    return withProject(({ db }) => {
+      const session = db.prepare("SELECT * FROM chat_sessions WHERE id = ?").get(body.sessionId);
+      if (!session) throw statusError(404, "Chat session not found.");
+      db.transaction(() => {
+        db.prepare("UPDATE scratchpad_entries SET translation_entry_id = NULL WHERE translation_entry_id IN (SELECT id FROM translation_entries WHERE chat_session_id = ?)").run(session.id);
+        db.prepare("DELETE FROM translation_entries WHERE chat_session_id = ?").run(session.id);
+        db.prepare("DELETE FROM chat_messages WHERE session_id = ?").run(session.id);
+        db.prepare("DELETE FROM chat_sessions WHERE id = ?").run(session.id);
+      })();
+      const active = ensureChatSession(db, session.page_id || "");
+      return sendJson(res, { chatSessions: getChatSessions(db, session.page_id || ""), activeChatSessionId: active.id, messages: getSessionMessages(db, active.id) });
     });
   }
 
@@ -694,12 +807,15 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/auth/openrouter/key") {
-    const body = await parseJson(req, 1024 * 64);
+    const body = parseBodyObject(await parseJson(req, 1024 * 64));
+    const key = requireString(body, "key", "OpenRouter API key");
+    const keyInfo = await fetchOpenRouterKeyInfo(key);
+    if (!keyInfo) throw statusError(401, "OpenRouter rejected that API key.");
     const config = await getConfig();
-    config.openRouterKey = String(body.key || "").trim();
+    config.openRouterKey = key;
     config.lastAuthError = "";
     await saveConfig(config);
-    return sendJson(res, { hasOpenRouterKey: Boolean(config.openRouterKey) });
+    return sendJson(res, { hasOpenRouterKey: true, keyInfo });
   }
 
   if (req.method === "POST" && url.pathname === "/api/auth/openrouter/migrate-legacy") {
@@ -727,7 +843,7 @@ async function handleApi(req, res, url) {
   }
 
   if (req.method === "POST" && url.pathname === "/api/chat/stream") {
-    const body = await parseJson(req);
+    const body = parseChatBody(parseBodyObject(await parseJson(req)));
     const config = await getConfig();
     if (!config.openRouterKey) throw statusError(401, "Connect OpenRouter or add an API key first.");
     return withProject(async ({ project, db }) => {
@@ -750,19 +866,44 @@ async function handleApi(req, res, url) {
       const createdAt = nowIso();
       db.prepare("INSERT INTO chat_messages (id, session_id, page_id, role, content, model, attachments_json, created_at) VALUES (?, ?, ?, 'user', ?, ?, ?, ?)")
         .run(userId, chatSession.id, body.pageId || null, body.message || "", model, JSON.stringify(attachments), createdAt);
+      const assistantId = id("msg");
       db.prepare("INSERT INTO chat_messages (id, session_id, page_id, role, content, model, attachments_json, created_at) VALUES (?, ?, ?, 'assistant', ?, ?, '[]', ?)")
-        .run(id("msg"), chatSession.id, body.pageId || null, assistantText, model, nowIso());
+        .run(assistantId, chatSession.id, body.pageId || null, assistantText, model, nowIso());
       touchChatSession(db, chatSession.id);
       const parsed = parseTranslationPass(assistantText);
-      if (body.pageId && parsed.length) upsertScratchpadFromPass(db, body.pageId, parsed);
+      if (body.pageId && parsed.length) storeTranslationEntries(db, {
+        pageId: body.pageId,
+        chatSessionId: chatSession.id,
+        chatMessageId: assistantId,
+        model,
+        entries: parsed,
+      });
       res.end();
     });
   }
 
+  if (req.method === "POST" && url.pathname === "/api/translation/import") {
+    const body = parseBodyObject(await parseJson(req, 1024 * 64));
+    const chatMessageId = requireString(body, "chatMessageId", "Chat message id");
+    return withProject(({ db }) => {
+      const result = importTranslationEntriesToScratchpad(db, chatMessageId);
+      return sendJson(res, result);
+    });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/translation/unimport") {
+    const body = parseBodyObject(await parseJson(req, 1024 * 64));
+    const chatMessageId = requireString(body, "chatMessageId", "Chat message id");
+    return withProject(({ db }) => {
+      const result = unimportTranslationEntriesFromScratchpad(db, chatMessageId);
+      return sendJson(res, result);
+    });
+  }
+
   if (req.method === "POST" && url.pathname === "/api/export") {
-    const body = await parseJson(req);
+    const body = parseExportBody(parseBodyObject(await parseJson(req)));
     return withProject(async ({ project, db }) => {
-      const file = await exportMarkdown(db, project.path, body);
+      const file = body.format === "json" ? await exportJson(db, project.path, body) : body.format === "csv" ? await exportCsv(db, project.path, body) : await exportMarkdown(db, project.path, body);
       return sendJson(res, { file });
     });
   }
@@ -773,6 +914,65 @@ async function handleApi(req, res, url) {
 function normalizeReasoningEffort(value) {
   const effort = String(value || "").toLowerCase();
   return REASONING_EFFORTS.has(effort) ? effort : "medium";
+}
+
+function parseCropBody(body, isCreate) {
+  if (isCreate) body.pageId = requireString(body, "pageId", "Page id");
+  else body.cropId = requireString(body, "cropId", "Crop id");
+  if (body.label !== undefined) body.label = optionalString(body, "label", 80);
+  if (body.name !== undefined) body.name = optionalString(body, "name", 160);
+  if (body.type !== undefined) body.type = normalizeLineType(body.type, body.label || body.name || "S1");
+  ["x", "y", "width", "height"].forEach((key) => {
+    if (body[key] !== undefined) {
+      const n = Number(body[key]);
+      if (!Number.isFinite(n)) throw statusError(422, `${key} must be a number.`);
+      body[key] = n;
+    }
+  });
+  if (isCreate && ["x", "y", "width", "height"].some((key) => body[key] === undefined)) {
+    throw statusError(422, "Crop rectangle is required.");
+  }
+  return body;
+}
+
+function parseScratchpadBody(body) {
+  if (!body.id) body.pageId = requireString(body, "pageId", "Page id");
+  body.id = optionalString(body, "id", 120);
+  body.translationEntryId = optionalString(body, "translationEntryId", 120);
+  body.label = optionalString(body, "label", 80);
+  body.type = normalizeLineType(body.type, body.label);
+  body.source = optionalString(body, "source", 20000);
+  body.draft = optionalString(body, "draft", 20000);
+  body.final = optionalString(body, "final", 20000);
+  body.notes = optionalString(body, "notes", 20000);
+  body.confirmed = body.confirmed ? 1 : 0;
+  return body;
+}
+
+function parseChatBody(body) {
+  body.pageId = optionalString(body, "pageId", 120);
+  body.chatSessionId = optionalString(body, "chatSessionId", 120);
+  body.message = optionalString(body, "message", 30000);
+  body.model = optionalString(body, "model", 240) || DEFAULT_MODEL;
+  body.reasoningEffort = normalizeReasoningEffort(body.reasoningEffort);
+  body.sourceLanguage = optionalString(body, "sourceLanguage", 80) || "Auto";
+  body.targetLanguage = optionalString(body, "targetLanguage", 80) || "English";
+  body.attachments = Array.isArray(body.attachments) ? body.attachments.map((item) => ({
+    type: optionalEnum(item?.type, ["page", "crop"], "page"),
+    id: String(item?.id || "").trim(),
+    name: String(item?.name || "").slice(0, 240),
+  })).filter((item) => item.id) : [];
+  if (!body.message.trim() && !body.attachments.length) throw statusError(422, "Message text or an attachment is required.");
+  return body;
+}
+
+function parseExportBody(body) {
+  body.scope = optionalEnum(body.scope, ["project", "page"], "project");
+  body.format = optionalEnum(body.format, ["md", "json", "csv"], "md");
+  body.pageId = optionalString(body, "pageId", 120);
+  if (body.scope === "page" && !body.pageId) throw statusError(422, "Page id is required for page export.");
+  body.include = body.include && typeof body.include === "object" && !Array.isArray(body.include) ? body.include : {};
+  return body;
 }
 
 async function importUploadedFiles(db, projectDir, files) {
@@ -818,7 +1018,7 @@ async function importFile(db, projectDir, filePath) {
   if (ext === ".cbr" || ext === ".rar") throw statusError(422, "CBR/RAR import needs an extractor dependency. Use CBZ/ZIP for this build.");
   if (ARCHIVE_EXTENSIONS.has(ext)) return importArchive(db, projectDir, await fsp.readFile(filePath), path.basename(filePath));
   if (!IMAGE_EXTENSIONS.has(ext)) return 0;
-  return importImage(db, projectDir, path.basename(filePath), null, filePath);
+  return importImage(db, projectDir, path.basename(filePath), null, filePath, await fileHash(filePath));
 }
 
 async function importBuffer(db, projectDir, name, buffer, ext) {
@@ -826,7 +1026,7 @@ async function importBuffer(db, projectDir, name, buffer, ext) {
   if (ext === ".cbr" || ext === ".rar") throw statusError(422, "CBR/RAR import needs an extractor dependency. Use CBZ/ZIP for this build.");
   if (ARCHIVE_EXTENSIONS.has(ext)) return importArchive(db, projectDir, buffer, name);
   if (!IMAGE_EXTENSIONS.has(ext)) return 0;
-  return importImage(db, projectDir, name, buffer, null);
+  return importImage(db, projectDir, name, buffer, null, bufferHash(buffer));
 }
 
 async function importArchive(db, projectDir, buffer, name) {
@@ -838,12 +1038,22 @@ async function importArchive(db, projectDir, buffer, name) {
     .sort((a, b) => sortByName(a.name, b.name));
   let count = 0;
   for (const entry of entries) {
-    count += await importImage(db, projectDir, `${path.parse(name).name}-${cleanName(entry.name)}`, await entry.async("nodebuffer"), null);
+    const entryBuffer = await entry.async("nodebuffer");
+    count += await importImage(db, projectDir, `${path.parse(name).name}-${cleanName(entry.name)}`, entryBuffer, null, bufferHash(entryBuffer));
   }
   return count;
 }
 
-async function importImage(db, projectDir, name, buffer, sourcePath) {
+async function fileHash(filePath) {
+  const hash = crypto.createHash("sha1");
+  await new Promise((resolve, reject) => {
+    fs.createReadStream(filePath).on("data", (chunk) => hash.update(chunk)).on("error", reject).on("end", resolve);
+  });
+  return hash.digest("hex");
+}
+
+async function importImage(db, projectDir, name, buffer, sourcePath, contentHash = "") {
+  if (contentHash && db.prepare("SELECT id FROM pages WHERE content_hash = ?").get(contentHash)) return 0;
   const next = db.prepare("SELECT COALESCE(MAX(order_index), -1) + 1 AS next FROM pages").get().next;
   const pageId = id("page");
   const base = `${String(next + 1).padStart(4, "0")}-${cleanName(name)}`;
@@ -866,8 +1076,8 @@ async function importImage(db, projectDir, name, buffer, sourcePath) {
     await sharp(originalAbs, { limitInputPixels: false }).rotate().png({ compressionLevel: 9 }).toFile(pageAbs);
   }
   const meta = await imageMetadata(pageAbs);
-  db.prepare("INSERT INTO pages (id, file_name, original_path, workspace_path, order_index, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-    .run(pageId, name, originalRel, pageRel, next, meta.width, meta.height, nowIso());
+  db.prepare("INSERT INTO pages (id, file_name, original_path, workspace_path, content_hash, order_index, width, height, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+    .run(pageId, name, originalRel, pageRel, contentHash || null, next, meta.width, meta.height, nowIso());
   return 1;
 }
 
@@ -950,12 +1160,12 @@ function upsertScratchpad(db, body) {
   const entryId = body.id || id("entry");
   const existing = body.id ? db.prepare("SELECT * FROM scratchpad_entries WHERE id = ?").get(body.id) : null;
   if (existing) {
-    db.prepare("UPDATE scratchpad_entries SET label = ?, type = ?, source = ?, draft = ?, final = ?, notes = ?, confirmed = ?, updated_at = ? WHERE id = ?")
-      .run(body.label || "", body.type || labelType(body.label), body.source || "", body.draft || "", body.final || "", body.notes || "", body.confirmed ? 1 : 0, nowIso(), body.id);
+    db.prepare("UPDATE scratchpad_entries SET translation_entry_id = ?, label = ?, type = ?, source = ?, draft = ?, final = ?, notes = ?, confirmed = ?, updated_at = ? WHERE id = ?")
+      .run(body.translationEntryId || existing.translation_entry_id || null, body.label || "", body.type || labelType(body.label), body.source || "", body.draft || "", body.final || "", body.notes || "", body.confirmed ? 1 : 0, nowIso(), body.id);
   } else {
     const next = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM scratchpad_entries WHERE page_id = ?").get(body.pageId).next;
-    db.prepare("INSERT INTO scratchpad_entries (id, page_id, label, type, source, draft, final, notes, confirmed, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(entryId, body.pageId, body.label || "", body.type || labelType(body.label), body.source || "", body.draft || "", body.final || "", body.notes || "", body.confirmed ? 1 : 0, next, nowIso(), nowIso());
+    db.prepare("INSERT INTO scratchpad_entries (id, page_id, translation_entry_id, label, type, source, draft, final, notes, confirmed, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(entryId, body.pageId, body.translationEntryId || null, body.label || "", body.type || labelType(body.label), body.source || "", body.draft || "", body.final || "", body.notes || "", body.confirmed ? 1 : 0, next, nowIso(), nowIso());
   }
   return db.prepare("SELECT * FROM scratchpad_entries WHERE id = ?").get(entryId);
 }
@@ -1114,9 +1324,9 @@ function parseTranslationPass(text) {
   for (const raw of String(text || "").split(/\r?\n/)) {
     const line = raw.trim();
     if (/^[-*_]{3,}$/.test(line) || /^#{1,6}\s*detailed/i.test(line) || /^\*\*Detailed/i.test(line)) break;
-    const field = line.match(/^(Label|Type|Source|Draft|Notes):\s*(.*)$/i);
+    const field = line.match(/^(?:[-*]\s*)?(?:\*\*)?(Label|Type|Source|Draft|Notes?)(?:\*\*)?\s*:\s*(.*)$/i);
     if (field) {
-      const key = field[1].toLowerCase();
+      const key = field[1].toLowerCase().replace(/^note$/, "notes");
       if (key === "label") { push(); current = { label: field[2].trim().toUpperCase() }; }
       else if (current) current[key] = field[2].trim();
     }
@@ -1125,19 +1335,85 @@ function parseTranslationPass(text) {
   return entries;
 }
 
-function upsertScratchpadFromPass(db, pageId, entries) {
-  const existing = new Set(db.prepare("SELECT label FROM scratchpad_entries WHERE page_id = ?").all(pageId).map((row) => row.label));
-  let next = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM scratchpad_entries WHERE page_id = ?").get(pageId).next;
-  for (const entry of entries) {
-    if (existing.has(entry.label)) continue;
-    db.prepare("INSERT INTO scratchpad_entries (id, page_id, label, type, source, draft, final, notes, confirmed, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?, ?)")
-      .run(id("entry"), pageId, entry.label, normalizeLineType(entry.type, entry.label), entry.source, entry.draft, entry.notes, next++, nowIso(), nowIso());
-    existing.add(entry.label);
-  }
+function storeTranslationEntries(db, { pageId, chatSessionId, chatMessageId, model, entries }) {
+  const crops = new Map(getCrops(db, pageId).map((crop) => [String(crop.label || "").toUpperCase(), crop.id]));
+  const insert = db.prepare(`
+    INSERT INTO translation_entries
+      (id, page_id, chat_session_id, chat_message_id, scratchpad_entry_id, label, type, source, draft, final, notes, confidence, crop_ids_json, model, sort_order, created_at, updated_at)
+    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, '', ?, NULL, ?, ?, ?, ?, ?)
+  `);
+  const now = nowIso();
+  entries.forEach((entry, index) => {
+    const label = String(entry.label || "").toUpperCase();
+    const cropId = crops.get(label);
+    insert.run(
+      id("translation"),
+      pageId,
+      chatSessionId || null,
+      chatMessageId || null,
+      label,
+      normalizeLineType(entry.type, label),
+      entry.source || "",
+      entry.draft || "",
+      entry.notes || "",
+      JSON.stringify(cropId ? [cropId] : []),
+      model || "",
+      index,
+      now,
+      now,
+    );
+  });
+}
+
+function importTranslationEntriesToScratchpad(db, chatMessageId) {
+  const entries = db.prepare("SELECT * FROM translation_entries WHERE chat_message_id = ? ORDER BY sort_order, label").all(chatMessageId);
+  if (!entries.length) throw statusError(404, "No structured translation entries found for that response.");
+  const existingLabels = new Set(db.prepare("SELECT label FROM scratchpad_entries WHERE page_id = ?").all(entries[0].page_id).map((row) => row.label));
+  let imported = 0;
+  const importOne = db.transaction(() => {
+    for (const entry of entries) {
+      if (entry.scratchpad_entry_id) continue;
+      if (existingLabels.has(entry.label)) continue;
+      const scratchpadId = id("entry");
+      const next = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM scratchpad_entries WHERE page_id = ?").get(entry.page_id).next;
+      db.prepare("INSERT INTO scratchpad_entries (id, page_id, translation_entry_id, label, type, source, draft, final, notes, confirmed, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?, ?)")
+        .run(scratchpadId, entry.page_id, entry.id, entry.label, entry.type, entry.source || "", entry.draft || "", entry.notes || "", next, nowIso(), nowIso());
+      db.prepare("UPDATE translation_entries SET scratchpad_entry_id = ?, updated_at = ? WHERE id = ?").run(scratchpadId, nowIso(), entry.id);
+      existingLabels.add(entry.label);
+      imported += 1;
+    }
+  });
+  importOne();
+  return {
+    imported,
+    page: getPage(db, entries[0].page_id),
+    scratchpad: getScratchpad(db, entries[0].page_id),
+    messages: getSessionMessages(db, entries[0].chat_session_id),
+  };
+}
+
+function unimportTranslationEntriesFromScratchpad(db, chatMessageId) {
+  const entries = db.prepare("SELECT * FROM translation_entries WHERE chat_message_id = ? ORDER BY sort_order, label").all(chatMessageId);
+  if (!entries.length) throw statusError(404, "No structured translation entries found for that response.");
+  let removed = 0;
+  const remove = db.transaction(() => {
+    for (const entry of entries) {
+      if (!entry.scratchpad_entry_id) continue;
+      db.prepare("DELETE FROM scratchpad_entries WHERE id = ? AND translation_entry_id = ?").run(entry.scratchpad_entry_id, entry.id);
+      db.prepare("UPDATE translation_entries SET scratchpad_entry_id = NULL, updated_at = ? WHERE id = ?").run(nowIso(), entry.id);
+      removed += 1;
+    }
+  });
+  remove();
+  return {
+    removed,
+    page: getPage(db, entries[0].page_id),
+    scratchpad: getScratchpad(db, entries[0].page_id),
+    messages: getSessionMessages(db, entries[0].chat_session_id),
+  };
 }
 
 async function exportMarkdown(db, projectDir, body) {
-  if (body.format && body.format !== "md") throw statusError(422, "Markdown export is implemented first; JSON/CSV are queued.");
   const decisions = getDecisions(db);
   let markdown = "# MangaTranslator Export\n\n";
   const pages = body.scope === "page"
@@ -1164,7 +1440,7 @@ async function exportMarkdown(db, projectDir, body) {
     }
   }
   if (body.include?.decisions !== false && decisions.length) {
-    markdown += "## Project Decisions\n\n";
+    markdown += "## Project Guide\n\n";
     decisions.forEach((d) => { markdown += `- ${d.category}: ${d.term} => ${d.rule}\n`; });
   }
   const file = body.scope === "page"
@@ -1173,6 +1449,72 @@ async function exportMarkdown(db, projectDir, body) {
   await ensureDir(path.dirname(file));
   await fsp.writeFile(file, markdown);
   return file;
+}
+
+async function exportJson(db, projectDir, body) {
+  const pages = body.scope === "page"
+    ? db.prepare("SELECT * FROM pages WHERE id = ?").all(body.pageId)
+    : getPages(db);
+  const pageIds = new Set(pages.map((page) => page.id));
+  const data = {
+    schema: "mangatranslator.translation.v1",
+    exportedAt: nowIso(),
+    pages: pages.map((page) => ({
+      ...page,
+      crops: body.include?.boxes === false ? undefined : getCrops(db, page.id),
+      scratchpad: getScratchpad(db, page.id),
+      translations: db.prepare("SELECT * FROM translation_entries WHERE page_id = ? ORDER BY sort_order, label").all(page.id).map((entry) => ({
+        ...entry,
+        crop_ids: JSON.parse(entry.crop_ids_json || "[]"),
+        crop_ids_json: undefined,
+      })),
+    })),
+    projectGuide: body.include?.decisions === false ? [] : getDecisions(db),
+  };
+  data.pages = data.pages.filter((page) => pageIds.has(page.id));
+  const file = body.scope === "page"
+    ? path.join(projectDir, "exports", "pages", `${path.parse(pages[0]?.file_name || "page").name}.json`)
+    : path.join(projectDir, "exports", "project.json");
+  await ensureDir(path.dirname(file));
+  await fsp.writeFile(file, `${JSON.stringify(data, null, 2)}\n`);
+  return file;
+}
+
+async function exportCsv(db, projectDir, body) {
+  const pages = body.scope === "page"
+    ? db.prepare("SELECT * FROM pages WHERE id = ?").all(body.pageId)
+    : getPages(db);
+  const rows = [["page", "label", "type", "source", "draft", "final", "confirmed", "notes", "translation_entry_id", "crop_ids"]];
+  for (const page of pages) {
+    for (const row of getScratchpad(db, page.id)) {
+      const linked = row.translation_entry_id
+        ? db.prepare("SELECT crop_ids_json FROM translation_entries WHERE id = ?").get(row.translation_entry_id)
+        : null;
+      rows.push([
+        page.file_name,
+        row.label,
+        row.type || labelType(row.label),
+        body.include?.source === false ? "" : row.source || "",
+        body.include?.draft === false ? "" : row.draft || "",
+        body.include?.final === false ? "" : row.final || "",
+        row.confirmed ? "yes" : "no",
+        body.include?.notes === false ? "" : row.notes || "",
+        row.translation_entry_id || "",
+        linked?.crop_ids_json || "[]",
+      ]);
+    }
+  }
+  const file = body.scope === "page"
+    ? path.join(projectDir, "exports", "pages", `${path.parse(pages[0]?.file_name || "page").name}.csv`)
+    : path.join(projectDir, "exports", "project.csv");
+  await ensureDir(path.dirname(file));
+  await fsp.writeFile(file, `${rows.map((row) => row.map(csvCell).join(",")).join("\n")}\n`);
+  return file;
+}
+
+function csvCell(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
 async function fetchOpenRouterKeyInfo(apiKey) {

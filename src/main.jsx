@@ -1,12 +1,19 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Streamdown } from "streamdown";
 import "./styles.css";
+
+const Streamdown = React.lazy(() => import("streamdown").then((module) => ({ default: module.Streamdown })));
 
 const DEFAULT_MODEL = "google/gemini-3.1-pro-preview";
 const LANGUAGES = ["Auto", "Japanese", "Korean", "Chinese", "English", "Spanish", "French", "German", "Italian", "Portuguese"];
 const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const GUIDE_SECTIONS = ["Character names", "Honorifics", "Recurring terms", "Tone", "SFX treatment"];
+const PASS_TEMPLATES = [
+  { id: "full-page", label: "Full page", title: "Full page pass", prompt: "Analyze the full attached page. Produce the structured translation pass first, then detailed line-by-line localization notes." },
+  { id: "crop-queue", label: "Crop queue", title: "Crop queue pass", prompt: "Analyze the attached crop queue in order. Preserve the crop order and produce one structured item per visible text region." },
+  { id: "line-refine", label: "Line refine", title: "Line refinement pass", prompt: "Focus on the selected line or crop. Give alternative translations, explain nuance, and recommend a polished final wording." },
+  { id: "terms", label: "Terminology", title: "Terminology pass", prompt: "Extract names, recurring terms, honorific choices, SFX handling notes, and style-guide rules worth adding to the Project Guide." },
+];
 
 const iconPaths = {
   logo: "M4 4h16v16H4z M8 8h8v2H8z M8 12h8v2H8z M8 16h5v2H8z",
@@ -74,6 +81,10 @@ function fileUrl(relativePath, cacheKey = "") {
 
 function classNames(...items) {
   return items.filter(Boolean).join(" ");
+}
+
+function clampPanelWidth(value) {
+  return Math.max(280, Math.min(620, Math.round(Number(value) || 340)));
 }
 
 function pathTail(value) {
@@ -170,6 +181,7 @@ function App() {
   const [workbenchFilter, setWorkbenchFilter] = useState("all");
   const [modal, setModal] = useState("");
   const [toast, setToast] = useState("");
+  const [dialog, setDialog] = useState(null);
   const [busy, setBusy] = useState(false);
   const [chatText, setChatText] = useState("");
   const [attachments, setAttachments] = useState([]);
@@ -178,12 +190,39 @@ function App() {
   const [importStatus, setImportStatus] = useState("");
   const [undoStack, setUndoStack] = useState([]);
   const [labelFocusCropId, setLabelFocusCropId] = useState("");
+  const [panelWidths, setPanelWidths] = useState({ workbench: 340, chat: 360 });
+  const [panelDrag, setPanelDrag] = useState(null);
 
   const showToast = (message) => {
     setToast(message);
     window.clearTimeout(showToast.timer);
     showToast.timer = window.setTimeout(() => setToast(""), 4200);
   };
+
+  const confirmAction = ({ title, message, confirmLabel = "Confirm", danger = false }) => new Promise((resolve) => {
+    setDialog({
+      type: "confirm",
+      title,
+      message,
+      confirmLabel,
+      danger,
+      onCancel: () => { setDialog(null); resolve(false); },
+      onConfirm: () => { setDialog(null); resolve(true); },
+    });
+  });
+
+  const promptAction = ({ title, message, placeholder = "", confirmLabel = "Continue" }) => new Promise((resolve) => {
+    setDialog({
+      type: "prompt",
+      title,
+      message,
+      placeholder,
+      value: "",
+      confirmLabel,
+      onCancel: () => { setDialog(null); resolve(""); },
+      onConfirm: (value) => { setDialog(null); resolve(String(value || "").trim()); },
+    });
+  });
 
   const refresh = async ({ keepPage = false } = {}) => {
     const data = await api("/api/status");
@@ -223,6 +262,17 @@ function App() {
     setAttachments([]);
   };
 
+  const createTemplateSession = async (template) => {
+    if (!state.page || !template) return;
+    const data = await api("/api/chat/session", { method: "POST", body: JSON.stringify({ pageId: state.page.id, title: template.title }) });
+    setState((s) => ({ ...s, chatSessions: data.chatSessions, activeChatSessionId: data.activeChatSessionId, messages: data.messages || [] }));
+    setChatText(template.prompt);
+    setAttachments([]);
+    if (template.id === "full-page") addAttachment({ type: "page", id: state.page.id, name: state.page.file_name });
+    if (template.id === "crop-queue") setAttachments(state.queue.map((crop) => ({ type: "crop", id: crop.id, name: crop.name || crop.label })));
+    if (template.id === "line-refine" && selectedCrop) addAttachment({ type: "crop", id: selectedCrop.id, name: selectedCrop.name || selectedCrop.label });
+  };
+
   const selectChatSession = async (sessionId) => {
     if (!state.page || !sessionId || sessionId === state.activeChatSessionId) return;
     const data = await api("/api/chat/session/select", { method: "POST", body: JSON.stringify({ pageId: state.page.id, sessionId }) });
@@ -236,6 +286,22 @@ function App() {
     setState((s) => ({ ...s, chatSessions: data.chatSessions, activeChatSessionId: data.activeChatSessionId, messages: data.messages || s.messages }));
   };
 
+  const archiveChatSession = async (session) => {
+    if (!session || !(await confirmAction({ title: "Archive Pass", message: `Archive ${session.title || "this chat pass"}?`, confirmLabel: "Archive" }))) return;
+    const data = await api("/api/chat/session/archive", { method: "POST", body: JSON.stringify({ sessionId: session.id }) });
+    setState((s) => ({ ...s, chatSessions: data.chatSessions, activeChatSessionId: data.activeChatSessionId, messages: data.messages || [] }));
+    setAttachments([]);
+    showToast("Chat pass archived.");
+  };
+
+  const deleteChatSession = async (session) => {
+    if (!session || !(await confirmAction({ title: "Delete Pass", message: `Delete ${session.title || "this chat pass"}? Scratchpad text will be kept.`, confirmLabel: "Delete", danger: true }))) return;
+    const data = await api("/api/chat/session/delete", { method: "POST", body: JSON.stringify({ sessionId: session.id }) });
+    setState((s) => ({ ...s, chatSessions: data.chatSessions, activeChatSessionId: data.activeChatSessionId, messages: data.messages || [] }));
+    setAttachments([]);
+    showToast("Chat pass deleted.");
+  };
+
   useEffect(() => {
     refresh().catch((error) => showToast(error.message));
     api("/api/models").then((data) => setState((s) => ({ ...s, models: data.data || [] }))).catch(() => {});
@@ -245,6 +311,24 @@ function App() {
     if (!state.activeProject) setModal("onboarding");
     else if (modal === "onboarding") setModal("");
   }, [state.activeProject]);
+
+  useEffect(() => {
+    if (!panelDrag) return;
+    const onPointerMove = (event) => {
+      const delta = panelDrag.startX - event.clientX;
+      setPanelWidths({
+        workbench: panelDrag.kind === "workbench" ? clampPanelWidth(panelDrag.workbench + delta) : panelDrag.workbench,
+        chat: panelDrag.kind === "chat" ? clampPanelWidth(panelDrag.chat + delta) : panelDrag.chat,
+      });
+    };
+    const onPointerUp = () => setPanelDrag(null);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+  }, [panelDrag]);
 
   const selectedCrop = state.crops.find((crop) => crop.id === selectedCropId) || null;
   const selectedEntry = state.scratchpad.find((entry) => entry.id === selectedEntryId) || state.scratchpad[0] || null;
@@ -280,7 +364,12 @@ function App() {
   };
 
   const importPath = async () => {
-    const sourcePath = window.prompt("Image, folder, ZIP, CBZ, CBR, or PDF path to import:");
+    const sourcePath = await promptAction({
+      title: "Import Path",
+      message: "Paste an image, folder, ZIP, CBZ, CBR, or PDF path to import.",
+      placeholder: "C:\\Manga\\chapter-01.cbz",
+      confirmLabel: "Import",
+    });
     if (!sourcePath) return;
     setBusy(true);
     try {
@@ -327,7 +416,7 @@ function App() {
   };
 
   const deleteScratchpad = async (entry) => {
-    if (!entry || !window.confirm(`Delete ${entry.label || "this line"} from the scratchpad?`)) return;
+    if (!entry || !(await confirmAction({ title: "Delete Line", message: `Delete ${entry.label || "this line"} from the scratchpad?`, confirmLabel: "Delete", danger: true }))) return;
     const data = await api("/api/scratchpad/remove", { method: "POST", body: JSON.stringify({ entryId: entry.id }) });
     setState((s) => ({
       ...s,
@@ -390,7 +479,7 @@ function App() {
 
   const removeCrop = async (crop, options = {}) => {
     if (!crop) return;
-    if (options.confirm !== false && !window.confirm(`Delete crop ${crop.label || crop.name || "this crop"}?`)) return;
+    if (options.confirm !== false && !(await confirmAction({ title: "Delete Crop", message: `Delete crop ${crop.label || crop.name || "this crop"}?`, confirmLabel: "Delete", danger: true }))) return;
     const data = await api("/api/crops/remove", { method: "POST", body: JSON.stringify({ cropId: crop.id }) });
     setState((s) => ({ ...s, queue: data.queue, crops: data.crops || [] }));
     setSelectedCropId("");
@@ -424,10 +513,26 @@ function App() {
 
   const clearChat = async (scope = "page") => {
     const text = scope === "project" ? "Clear all chat messages for this project?" : "Clear the current chat pass?";
-    if (!window.confirm(text)) return;
+    if (!(await confirmAction({ title: "Clear Chat", message: text, confirmLabel: "Clear", danger: true }))) return;
     const data = await api("/api/chat/clear", { method: "POST", body: JSON.stringify({ pageId: state.page?.id, sessionId: state.activeChatSessionId, scope }) });
     setState((s) => ({ ...s, chatSessions: data.chatSessions || s.chatSessions, activeChatSessionId: data.activeChatSessionId || s.activeChatSessionId, messages: data.messages || [] }));
     setAttachments([]);
+  };
+
+  const applyTranslationImport = async (message, undo = false) => {
+    if (!message?.id) return;
+    const data = await api(undo ? "/api/translation/unimport" : "/api/translation/import", {
+      method: "POST",
+      body: JSON.stringify({ chatMessageId: message.id }),
+    });
+    setState((s) => ({
+      ...s,
+      page: data.page || s.page,
+      pages: data.page ? s.pages.map((page) => page.id === data.page.id ? data.page : page) : s.pages,
+      scratchpad: data.scratchpad || s.scratchpad,
+      messages: data.messages || s.messages,
+    }));
+    showToast(undo ? `Removed ${data.removed || 0} imported line${data.removed === 1 ? "" : "s"} from scratchpad.` : `Sent ${data.imported || 0} line${data.imported === 1 ? "" : "s"} to scratchpad.`);
   };
 
   useEffect(() => {
@@ -542,7 +647,7 @@ function App() {
         onAccount={() => setModal("account")}
       />
       {mode === "translation" ? (
-        <main className="translation-layout">
+        <main className={classNames("translation-layout", panelDrag && "resizing")} style={{ "--workbench-w": `${panelWidths.workbench}px`, "--chat-w": `${panelWidths.chat}px` }}>
           <PageStrip pages={state.pages} current={state.page?.id} onSelect={loadPage} onImportPath={importPath} onFiles={importFiles} />
           <Viewer
             page={state.page}
@@ -560,6 +665,7 @@ function App() {
             }}
             onAttachPage={() => state.page && addAttachment({ type: "page", id: state.page.id, name: state.page.file_name })}
           />
+          <div className="splitter" role="separator" aria-label="Resize workbench" onPointerDown={(event) => setPanelDrag({ kind: "workbench", startX: event.clientX, ...panelWidths })} />
           <Workbench
             page={state.page}
             crops={state.crops}
@@ -589,6 +695,7 @@ function App() {
               if (state.page) addAttachment({ type: "page", id: state.page.id, name: state.page.file_name });
             }}
           />
+          <div className="splitter" role="separator" aria-label="Resize chat" onPointerDown={(event) => setPanelDrag({ kind: "chat", startX: event.clientX, ...panelWidths })} />
           <ChatPanel
             messages={state.messages}
             models={state.models}
@@ -619,16 +726,21 @@ function App() {
             onFillPrompt={() => setChatText(defaultChatPrompt())}
             onGuide={() => setModal("decisions")}
             onNewSession={createChatSession}
+            onTemplateSession={createTemplateSession}
             onSelectSession={selectChatSession}
             onRenameSession={renameChatSession}
+            onArchiveSession={archiveChatSession}
+            onDeleteSession={deleteChatSession}
             onClearChat={clearChat}
+            onImportTranslation={(message) => applyTranslationImport(message, false)}
+            onUndoTranslationImport={(message) => applyTranslationImport(message, true)}
             onSubmit={sendChat}
           />
         </main>
       ) : <TypesettingPlaceholder />}
 
       {modal === "onboarding" && <Onboarding state={state} onClose={() => setModal("")} onRefresh={refresh} showToast={showToast} />}
-      {modal === "projects" && <ProjectsModal state={state} onClose={() => setModal("")} onRefresh={refresh} showToast={showToast} />}
+      {modal === "projects" && <ProjectsModal state={state} onClose={() => setModal("")} onRefresh={refresh} showToast={showToast} confirmAction={confirmAction} />}
       {modal === "model" && <ModelPicker models={state.models} selected={state.selectedModel} query={modelQuery} setQuery={setModelQuery} visionOnly={visionOnly} setVisionOnly={setVisionOnly} onClose={() => setModal("")} onSelect={(modelId) => { setSetting({ defaultModel: modelId }).catch((error) => showToast(error.message)); setModal(""); }} />}
       {modal === "settings" && <SettingsModal state={state} onClose={() => setModal("")} onSave={setSetting} showToast={showToast} />}
       {modal === "account" && <AccountModal state={state} onClose={() => setModal("")} onRefresh={refresh} showToast={showToast} />}
@@ -641,6 +753,7 @@ function App() {
         const data = await api("/api/decisions", { method: "POST", body: JSON.stringify({ decisions }) });
         setState((s) => ({ ...s, decisions: data.decisions }));
       }} />}
+      {dialog && <AppDialog dialog={dialog} />}
       {toast && <div className="toast">{toast}</div>}
       {busy && <div className="busy">{importStatus || "Working..."}</div>}
     </div>
@@ -1140,7 +1253,7 @@ function EntryEditor({ entry, onSave, onDelete, onAsk }) {
   );
 }
 
-function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attachments, setAttachments, crops, queue, page, selectedCrop, decisions, text, setText, busy, hasKey, model, reasoningEffort, sourceLanguage, targetLanguage, onLanguage, onReasoningEffort, onChooseModel, onAttachPage, onAttachSelection, hasSelection, onAttachQueue, onFillPrompt, onGuide, onNewSession, onSelectSession, onRenameSession, onClearChat, onSubmit }) {
+function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attachments, setAttachments, crops, queue, page, selectedCrop, decisions, text, setText, busy, hasKey, model, reasoningEffort, sourceLanguage, targetLanguage, onLanguage, onReasoningEffort, onChooseModel, onAttachPage, onAttachSelection, hasSelection, onAttachQueue, onFillPrompt, onGuide, onNewSession, onTemplateSession, onSelectSession, onRenameSession, onArchiveSession, onDeleteSession, onClearChat, onImportTranslation, onUndoTranslationImport, onSubmit }) {
   const pageAttached = Boolean(page && attachments.some((item) => item.type === "page" && item.id === page.id));
   const attachedCropIds = new Set(attachments.filter((item) => item.type === "crop").map((item) => item.id));
   const selectionAttached = Boolean(selectedCrop && attachedCropIds.has(selectedCrop.id));
@@ -1182,7 +1295,14 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         )}
         <button className="btn icon sm ghost" onClick={() => startRename(activeSession)} disabled={!activeSession} title="Rename active pass" aria-label="Rename active pass"><Icon name="pencil" /></button>
         <button className="btn icon sm ghost" onClick={onNewSession} disabled={!page} title="New pass" aria-label="New chat pass"><Icon name="plus" /></button>
+        <button className="btn icon sm ghost" onClick={() => onArchiveSession(activeSession)} disabled={!activeSession} title="Archive pass" aria-label="Archive active pass"><Icon name="archive" /></button>
+        <button className="btn icon sm ghost" onClick={() => onDeleteSession(activeSession)} disabled={!activeSession} title="Delete pass" aria-label="Delete active pass"><Icon name="trash" /></button>
         <button className="btn sm ghost subtle" onClick={() => onClearChat("session")} disabled={!messages.length}>Clear</button>
+      </div>
+      <div className="template-row">
+        {PASS_TEMPLATES.map((template) => (
+          <button key={template.id} className="btn sm ghost" disabled={!page || (template.id === "crop-queue" && !queue.length) || (template.id === "line-refine" && !hasSelection)} onClick={() => onTemplateSession(template)}>{template.label}</button>
+        ))}
       </div>
       <div className="language-row">
         <Icon name="globe" />
@@ -1207,7 +1327,7 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         <button className="pill guide-chip" onClick={onGuide} title={guideSummary(decisions)}><Icon name="book" size={11} /> {guideShortSummary(decisions)}</button>
       </div>
       <div className="message-list mt-scroll">
-        {messages.map((message, index) => <Message key={message.id || index} message={message} models={models} />)}
+        {messages.map((message, index) => <Message key={message.id || index} message={message} models={models} onImportTranslation={onImportTranslation} onUndoTranslationImport={onUndoTranslationImport} />)}
         {!messages.length && (
           <div className="chat-empty">
             <p>Start a focused pass for this page.</p>
@@ -1243,8 +1363,9 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
   );
 }
 
-function Message({ message, models }) {
+function Message({ message, models, onImportTranslation, onUndoTranslationImport }) {
   const attachments = safeJson(message.attachments_json, []);
+  const structuredEntries = safeJson(message.translation_entries_json, []);
   const isUser = message.role === "user";
   const isError = String(message.role).includes("error");
   const isAssistant = String(message.role).startsWith("assistant");
@@ -1252,10 +1373,21 @@ function Message({ message, models }) {
   const modelName = isAssistant && message.model ? modelLabelForId(message.model, models) : "";
   const bodyText = String(message.content || "").trim();
   const hasBody = Boolean(bodyText && !(isUser && bodyText === "..." && attachments.length));
+  const importedCount = structuredEntries.filter((entry) => entry.scratchpad_entry_id).length;
   return (
     <article className={classNames("message", isUser ? "user" : "assistant", isError && "error")}>
       <div className="message-meta"><span>{roleLabel}</span>{modelName && <b title={message.model}>{modelName}</b>}{message.created_at && <time>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}{attachments.length > 0 && <b>{attachments.length} attachment{attachments.length === 1 ? "" : "s"}</b>}</div>
       {attachments.length > 0 && <div className="message-attachments">{attachments.map((a) => <span key={`${a.type}:${a.id}`}>{a.type}: {a.name || a.id}</span>)}</div>}
+      {isAssistant && structuredEntries.length > 0 && (
+        <div className="translation-actions">
+          <span>{structuredEntries.length} structured line{structuredEntries.length === 1 ? "" : "s"}{importedCount ? ` · ${importedCount} in scratchpad` : ""}</span>
+          {importedCount ? (
+            <button className="btn sm ghost" onClick={() => onUndoTranslationImport?.(message)}><Icon name="close" /> Undo scratchpad</button>
+          ) : (
+            <button className="btn sm primary" onClick={() => onImportTranslation?.(message)}><Icon name="check" /> Send to scratchpad</button>
+          )}
+        </div>
+      )}
       {hasBody ? <MessageBody content={message.content} isAssistant={isAssistant} /> : (isAssistant && <div className="message-bubble pending">...</div>)}
     </article>
   );
@@ -1284,7 +1416,9 @@ function MessageBody({ content, isAssistant }) {
 function MarkdownBubble({ content }) {
   return (
     <div className="message-bubble markdown-body">
-      <Streamdown>{String(content || "")}</Streamdown>
+      <Suspense fallback={<span>{String(content || "")}</span>}>
+        <Streamdown>{String(content || "")}</Streamdown>
+      </Suspense>
     </div>
   );
 }
@@ -1371,7 +1505,7 @@ function Onboarding({ state, onClose, onRefresh, showToast }) {
   );
 }
 
-function ProjectsModal({ state, onClose, onRefresh, showToast }) {
+function ProjectsModal({ state, onClose, onRefresh, showToast, confirmAction }) {
   const [workspaceRoot, setWorkspaceRoot] = useState(state.workspaceRoot || state.defaultWorkspaceRoot);
   const [projectName, setProjectName] = useState("New Manga Project");
   const [importMode, setImportMode] = useState("copy");
@@ -1393,6 +1527,16 @@ function ProjectsModal({ state, onClose, onRefresh, showToast }) {
       showToast(error.message);
     }
   };
+  const deleteProject = async (project) => {
+    if (!project || !(await confirmAction({ title: "Delete Project", message: `Delete project ${project.name}? This removes its local workspace folder.`, confirmLabel: "Delete", danger: true }))) return;
+    try {
+      await api("/api/projects/delete", { method: "POST", body: JSON.stringify({ slug: project.slug }) });
+      await onRefresh();
+      showToast("Project deleted.");
+    } catch (error) {
+      showToast(error.message);
+    }
+  };
   return (
     <Modal wide title="Projects" onClose={onClose}>
       <div className="projects-modal">
@@ -1400,10 +1544,13 @@ function ProjectsModal({ state, onClose, onRefresh, showToast }) {
           <h3>Open project</h3>
           <div className="project-list">
             {state.projects.map((project) => (
-              <button key={project.slug} className={state.activeProject?.slug === project.slug ? "active" : ""} onClick={() => openProject(project.slug)}>
-                <b>{project.name}</b>
-                <span>{project.path}</span>
-              </button>
+              <div key={project.slug} className={classNames("project-row", state.activeProject?.slug === project.slug && "active")}>
+                <button onClick={() => openProject(project.slug)}>
+                  <b>{project.name}</b>
+                  <span>{project.path}</span>
+                </button>
+                <button className="btn icon sm ghost" onClick={() => deleteProject(project)} title="Delete project" aria-label={`Delete project ${project.name}`}><Icon name="trash" /></button>
+              </div>
             ))}
             {!state.projects.length && <p className="muted">No projects yet.</p>}
           </div>
@@ -1459,6 +1606,7 @@ function SettingsModal({ state, onClose, onSave, showToast }) {
 
 function AccountModal({ state, onClose, onRefresh, showToast }) {
   const [key, setKey] = useState("");
+  const [busy, setBusy] = useState(false);
   const migrateLegacyKey = async () => {
     try {
       await api("/api/auth/openrouter/migrate-legacy", { method: "POST", body: JSON.stringify({}) });
@@ -1469,6 +1617,19 @@ function AccountModal({ state, onClose, onRefresh, showToast }) {
       showToast(error.message);
     }
   };
+  const saveKey = async () => {
+    setBusy(true);
+    try {
+      await api("/api/auth/openrouter/key", { method: "POST", body: JSON.stringify({ key }) });
+      await onRefresh();
+      showToast("OpenRouter key validated and saved locally.");
+      onClose();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <Modal title="OpenRouter account" onClose={onClose}>
       <p>{state.hasOpenRouterKey ? "OpenRouter is connected locally." : "Connect OpenRouter, paste an API key, or reuse the legacy local key if available."}</p>
@@ -1476,7 +1637,7 @@ function AccountModal({ state, onClose, onRefresh, showToast }) {
       {state.authError && <p className="notice danger">Last OpenRouter callback error: {state.authError}</p>}
       <button className="btn primary" onClick={async () => { const data = await api("/api/auth/openrouter/start"); window.open(data.url, "_blank", "width=960,height=800"); showToast("OpenRouter login opened."); setTimeout(onRefresh, 5000); }}><Icon name="sparkle" /> Connect OpenRouter</button>
       {state.legacyOpenRouterKeyAvailable && !state.hasOpenRouterKey && <button className="btn ghost" onClick={migrateLegacyKey}><Icon name="key" /> Use legacy local key</button>}
-      <div className="key-row"><input type="password" placeholder="sk-or-v1-..." value={key} onChange={(e) => setKey(e.target.value)} /><button className="btn" onClick={async () => { await api("/api/auth/openrouter/key", { method: "POST", body: JSON.stringify({ key }) }); await onRefresh(); onClose(); }}>Save key</button></div>
+      <div className="key-row"><input type="password" placeholder="sk-or-v1-..." value={key} onChange={(e) => setKey(e.target.value)} /><button className="btn" disabled={busy || !key.trim()} onClick={saveKey}>{busy ? "Checking..." : "Save key"}</button></div>
       {state.keyInfo && <pre>{JSON.stringify(state.keyInfo, null, 2)}</pre>}
     </Modal>
   );
@@ -1544,6 +1705,31 @@ function DecisionsModal({ project, decisions, onClose, onSave }) {
 
 function TypesettingPlaceholder() {
   return <main className="typesetting"><Icon name="type" size={32} /><h1>Typesetting</h1><p>Place final translations back onto the page with text-clearing, balloon fills, font rules, flattened PNG export, and layered output. Queued after translation mode feels excellent.</p><div><b>Shipping order</b><span>Image cleaning</span><span>Text placement linked to finals</span><span>Font management</span><span>Layered export</span></div></main>;
+}
+
+function AppDialog({ dialog }) {
+  const [value, setValue] = useState(dialog.value || "");
+  const submit = (event) => {
+    event.preventDefault();
+    if (dialog.type === "prompt") dialog.onConfirm(value);
+    else dialog.onConfirm();
+  };
+  return (
+    <div className="overlay" onMouseDown={dialog.onCancel}>
+      <form className="modal dialog-modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+        <header><h2>{dialog.title}</h2><button type="button" className="btn icon sm ghost" onClick={dialog.onCancel} title="Cancel" aria-label="Cancel"><Icon name="close" /></button></header>
+        <div className="modal-pane">
+          <p>{dialog.message}</p>
+          {dialog.type === "prompt" && <input autoFocus value={value} placeholder={dialog.placeholder || ""} onChange={(event) => setValue(event.target.value)} />}
+        </div>
+        <div className="hstack modal-actions">
+          <span className="spacer" />
+          <button type="button" className="btn ghost" onClick={dialog.onCancel}>Cancel</button>
+          <button className={classNames("btn", dialog.danger ? "danger" : "primary")}>{dialog.confirmLabel || "Confirm"}</button>
+        </div>
+      </form>
+    </div>
+  );
 }
 
 function Modal({ title, children, onClose, wide }) {

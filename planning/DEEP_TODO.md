@@ -1,5 +1,67 @@
 # MangaTranslator Deep To-Do
 
+## 0. Priority Task Sets
+
+### Set 1: Core Data Model
+- [x] Create a first-class structured translation schema for line label, type, source, draft, final, notes, confidence, crop ids, page id, chat pass id, and model metadata.
+- [x] Store model responses as structured records linked to page, crop, chat pass, and scratchpad rows.
+- [x] Make first-pass "Send to scratchpad" / auto-populate behavior explicit and reversible.
+- [x] Add JSON export from the structured translation schema.
+
+### Set 2: Stability And Boundaries
+- [x] Add runtime schema validation for API request bodies before writing to SQLite or the filesystem.
+- [x] Pin direct dependency versions instead of using `latest` ranges.
+- [x] Remove unused dependencies, including `@openrouter/sdk` if the raw HTTP path remains the supported implementation.
+- [x] Resolve the transitive `uuid` advisory from `streamdown` / `mermaid` when dependency updates allow it.
+- [x] Add immediate validation feedback after manual OpenRouter key save.
+
+### Set 3: App Structure
+- [ ] Split `src/main.jsx` into stable workflow modules: viewer, workbench, chat, modals, API client, and parsers.
+- [ ] Move chat/translation parsing helpers into dedicated parser modules with focused tests.
+- [ ] Move frontend API helpers into an API/client module with shared response/error handling.
+- [ ] Evaluate TanStack Query for project/page/status/chat cache, mutations, optimistic updates, and invalidation.
+- [ ] Evaluate React Hook Form for settings, account, Project Guide, export, and onboarding forms after UI modules are split.
+
+### Set 4: Workbench Workflow
+- [x] Add archive/delete controls for chat passes with confirmation.
+- [x] Add pass templates: full page pass, crop queue pass, line refinement pass, terminology pass.
+- [ ] Render structured first-pass output as editable line cards linked to scratchpad rows.
+- [ ] Add autosave debounce indicators for scratchpad edits.
+- [ ] Add persistent undo/redo for scratchpad edits and chat/context clearing.
+
+### Set 5: Layout And Daily Usability
+- [x] Make the Workbench and chat panels horizontally adjustable with draggable splitters.
+- [x] Add responsive behavior so Workbench and chat remain reachable below desktop widths.
+- [x] Replace remaining native `prompt` / `confirm` dialogs with in-app modal flows.
+- [ ] Improve empty/import states for no project, empty project, no page, no crops, no scratchpad rows, and no chat.
+- [ ] Make sent attachments visually distinct from ready-to-send attachments.
+
+### Set 6: Import Pipeline
+- [ ] Add import progress for large folders, ZIP, and CBZ jobs.
+- [x] Add duplicate import detection or clear duplicate handling.
+- [ ] Add browser-upload and local-path sample import coverage.
+- [ ] Implement PDF rasterization into page images.
+- [ ] Implement CBR extraction if a portable extractor is practical.
+
+### Set 7: Testing And QA
+- [ ] Expand smoke tests beyond "server responds" into project/page/chat/export behavior checks.
+- [ ] Add Playwright flows for import, crop creation/editing, chat, scratchpad, and export.
+- [ ] Add visual regression screenshots for the PDF-derived screens.
+- [ ] Add fixture projects/images for deterministic tests.
+
+### Set 8: Export And Interop
+- [x] Add CSV export.
+- [x] Rename Markdown export terminology from Project Decisions to Project Guide.
+- [x] Avoid writing secrets to project exports or chat transcripts.
+- [x] Add a project cleanup/manage dialog for test projects and stale imports.
+
+### Set 9: Visual Fidelity
+- [ ] Tune prototype/PDF visual details after core behavior settles.
+- [ ] Improve model picker rows with provider avatars, badges, pricing, and selected-state treatment.
+- [ ] Match settings/export modal layouts to the prototype.
+- [ ] Tune typography and color consistency.
+- [ ] Polish the typesetting placeholder.
+
 ## 1. Planning Artifacts
 - [x] Create `planning/`.
 - [x] Add rebuild plan.
@@ -65,13 +127,13 @@
 - [x] Copy draft to final.
 - [x] Delete with confirmation.
 - [x] Ask about selected line by adding contextual prompt.
-- [ ] Make the Workbench and chat panels horizontally adjustable with draggable splitters.
+- [x] Make the Workbench and chat panels horizontally adjustable with draggable splitters.
 
 ## 9. Chat And Translation Flow
 - [x] Persist chat messages.
 - [x] Attach current page, selected crop, or queue.
 - [x] Stream model response.
-- [x] Parse first-pass translation into scratchpad.
+- [x] Parse first-pass translation into structured entries that can be sent to scratchpad.
 - [x] Preserve full assistant response.
 - [x] Keep prompt output table-free.
 - [x] Include language, queue order, labels, and project decisions in context.
@@ -100,7 +162,7 @@
 - [x] Add/edit/delete rules.
 - [x] Save project-wide.
 - [x] Include compact summary in model context.
-- [x] Include decisions in Markdown export.
+- [x] Include Project Guide rules in Markdown export.
 - [x] Promote Project Guide access from tiny workbench icon to top-level chrome button.
 - [x] Show Project Guide as a visible chat context chip.
 - [x] Keep Project Guide model context compact and capped instead of dumping unlimited rules.
@@ -109,9 +171,10 @@
 ## 13. Export
 - [x] Markdown page export.
 - [x] Markdown project export.
-- [x] Include source, draft, final, notes, crop boxes, decisions.
-- [ ] JSON export.
-- [ ] CSV export.
+- [x] Include source, draft, final, notes, crop boxes, and Project Guide rules.
+- [x] JSON export.
+- [x] CSV export.
+- [x] Rename Markdown export terminology from Project Decisions to Project Guide.
 
 ## 14. Typesetting Placeholder
 - [x] Keep prototype placeholder.
@@ -123,6 +186,9 @@
 - [x] API-compatible cache copies only.
 - [x] Missing files handled with readable errors.
 - [ ] Full Windows/Linux manual launch verification.
+- [ ] Expand smoke tests beyond "server responds" into project/page/chat/export behavior checks.
+- [ ] Add Playwright flows for import, crop creation/editing, chat, scratchpad, and export.
+- [ ] Add fixture projects/images for deterministic tests.
 
 ## 16. Current Functional Bug Bash
 - [x] OpenRouter connect error: document the observed `409 Failed to create or update app while creating auth code` path and make the in-app recovery path obvious.
@@ -185,9 +251,9 @@
 - [x] Add current-pass selection UI in the chat panel.
 - [x] Add clear-current-pass behavior separate from clear-whole-project chat.
 - [x] Replace chat pass rename browser prompt with an inline rename field/menu.
-- [ ] Add archive/delete chat pass controls with confirmation.
-- [ ] Add pass templates: Full page pass, crop queue pass, line refinement pass, terminology pass.
-- [ ] First-pass parser UI: expose "Send to scratchpad" / auto-populate behavior clearly, without making users touch Markdown tables.
+- [x] Add archive/delete chat pass controls with confirmation.
+- [x] Add pass templates: Full page pass, crop queue pass, line refinement pass, terminology pass.
+- [x] First-pass parser UI: expose "Send to scratchpad" / auto-populate behavior clearly, without making users touch Markdown tables.
 - [ ] Model picker: match prototype rows with provider avatars, vision/favorite/default badges, available count, pricing/context alignment, and full orange selected row.
 - [ ] Settings modal: match prototype side-nav with icons and pages for System prompt, Languages, Workspace, Image quality, Account, and Shortcuts.
 - [ ] Settings prompt page: include reset/default and preset affordances shown in the PDF.
@@ -214,13 +280,14 @@
 - [x] Send a queue-only chat request path up to the OpenRouter-key gate without typed text.
 - [x] If an OpenRouter key is connected, carefully run one low-risk translation request against a sample page.
 - [x] Confirm streamed response persists in chat.
-- [x] Confirm first-pass translation rows populate scratchpad.
+- [x] Confirm first-pass translation rows can be sent to scratchpad.
 - [x] Restart server and confirm sample project state persists.
 - [x] Export current sample page to Markdown.
 - [x] Export whole sample project to Markdown.
 - [x] Use Computer Use / browser automation to verify the UI visually after each major interaction pass.
 
 ## 19. Near-Term Backend Gaps
+- [x] Add runtime schema validation for API request bodies before writing to SQLite or the filesystem.
 - [x] Implement crop deletion endpoint and UI.
 - [x] Implement crop rename/type edit after creation.
 - [x] Implement crop move/resize persistence endpoint so text crops can be corrected without recreating them.
@@ -231,26 +298,32 @@
 - [x] Store active chat session in project state and include only that session in model context.
 - [ ] Add command history persistence for undoable crop create/move/resize/delete operations.
 - [ ] Add command history persistence for scratchpad edits and chat/context clearing.
-- [ ] Store model responses in a structured internal translation schema: label, type, source, draft, notes, confidence, crop ids, and page id.
+- [x] Store model responses in a structured internal translation schema: label, type, source, draft, notes, confidence, crop ids, and page id.
+- [x] Link structured model response records to page, crop, chat pass, model, and scratchpad row identifiers.
 - [x] Add page-level progress rollups derived from scratchpad totals: drafted count, final count, total detected/expected lines.
 - [x] Add project-level progress rollups derived from page status.
 - [ ] Add import progress for large ZIP/CBZ/folder jobs.
-- [ ] Add duplicate import detection or clear duplicate handling.
+- [x] Add duplicate import detection or clear duplicate handling.
 - [ ] Implement PDF rasterization into page images.
 - [ ] Keep PDF import below image/folder/ZIP/CBZ stability work in priority.
 - [ ] Implement CBR extraction if a portable extractor is available.
-- [ ] Add JSON export.
-- [ ] Add CSV export.
+- [x] Add JSON export.
+- [x] Add CSV export.
 - [x] Add better OpenRouter streaming error normalization for model/provider failures.
-- [ ] Add account/key validation feedback immediately after manual key save.
-- [ ] Avoid writing secrets to project exports or chat transcripts.
-- [ ] Add a project cleanup/manage dialog for test projects and stale imports.
+- [x] Add account/key validation feedback immediately after manual key save.
+- [x] Avoid writing secrets to project exports or chat transcripts.
+- [x] Add a project cleanup/manage dialog for test projects and stale imports.
 
 ## 20. Near-Term Frontend Gaps
 - [ ] Split the large `src/main.jsx` into stable components after behavior settles.
+- [ ] Move chat/translation parsing helpers into dedicated parser modules with focused tests.
+- [ ] Move frontend API helpers into an API/client module with shared response/error handling.
+- [ ] Evaluate TanStack Query for project/page/status/chat cache, mutations, optimistic updates, and invalidation.
+- [ ] Evaluate React Hook Form for settings, account, Project Guide, export, and onboarding forms after UI modules are split.
 - [x] Add keyboard shortcuts: V select, C crop, H pan, Shift+Enter send, Q queue.
 - [x] Add drag/drop import overlay on the viewer.
 - [ ] Add folder picker affordance that is clearer than hidden input buttons.
+- [x] Replace remaining native `prompt` / `confirm` dialogs with in-app modal flows.
 - [x] Add "attach current page" visible state so users know the context is queued for sending.
 - [x] Add "attach selected crop" visible state and disabled state when no crop is selected.
 - [x] Add clear-all attachments button.
@@ -276,7 +349,7 @@
 - [x] Add clear current chat/context control in chat header.
 - [x] Add multiple chat/thread picker in chat header.
 - [x] Represent chats as named translation passes/threads per page and project.
-- [ ] Add "Archive pass" controls with confirmation.
+- [x] Add "Archive pass" controls with confirmation.
 - [x] Add "new chat" control that starts a clean model context while preserving old transcripts.
 - [x] Show active chat session/pass name and context scope in the chat header.
 - [x] Display model name, timestamp, and attachment count on every chat message.
@@ -289,8 +362,14 @@
 - [ ] Add save-on-blur for scratchpad fields.
 - [ ] Add polished empty states for no project, empty project, no page, no crops, no scratchpad rows, no chat.
 - [x] Replace empty chat sentence with focused starter actions.
-- [ ] Add responsive behavior that keeps the workbench/chat reachable below desktop widths.
+- [x] Add responsive behavior that keeps the workbench/chat reachable below desktop widths.
 - [ ] Add visual regression screenshots for the PDF-derived screens.
+
+## 21. Dependency And Packaging Gaps
+- [x] Pin direct dependency versions instead of using `latest` ranges.
+- [x] Remove unused dependencies, including `@openrouter/sdk` if the raw HTTP path remains the supported implementation.
+- [x] Resolve the transitive `uuid` advisory from `streamdown` / `mermaid` when dependency updates allow it.
+- [x] Code-split or dynamically load heavy Markdown/diagram rendering paths if the production bundle keeps growing.
 
 ## Decision Log
 - React/Vite chosen over browser Babel for production.
