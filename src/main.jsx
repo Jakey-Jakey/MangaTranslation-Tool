@@ -1,9 +1,11 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { Streamdown } from "streamdown";
 import "./styles.css";
 
 const DEFAULT_MODEL = "google/gemini-3.1-pro-preview";
 const LANGUAGES = ["Auto", "Japanese", "Korean", "Chinese", "English", "Spanish", "French", "German", "Italian", "Portuguese"];
+const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const GUIDE_SECTIONS = ["Character names", "Honorifics", "Recurring terms", "Tone", "SFX treatment"];
 
 const iconPaths = {
@@ -118,6 +120,8 @@ function progressCounts(page) {
 function progressLabel(page) {
   const { total, drafted, final } = progressCounts(page);
   if (!total) return "No lines";
+  if (drafted >= total) return `Final ${final}/${total}`;
+  if (final >= total) return `Final ${final}/${total}`;
   return `Drafted ${drafted}/${total} · Final ${final}/${total}`;
 }
 
@@ -319,7 +323,7 @@ function App() {
       pages: data.page ? s.pages.map((page) => page.id === data.page.id ? data.page : page) : s.pages,
       scratchpad: data.scratchpad,
     }));
-    if (data.entry?.id) setSelectedEntryId(data.entry.id);
+    if (!entry.id && data.entry?.id) setSelectedEntryId(data.entry.id);
   };
 
   const deleteScratchpad = async (entry) => {
@@ -484,6 +488,7 @@ function App() {
           chatSessionId: state.activeChatSessionId,
           message,
           model: state.selectedModel,
+          reasoningEffort: state.settings.reasoningEffort || "medium",
           sourceLanguage: state.settings.sourceLanguage || "Auto",
           targetLanguage: state.settings.targetLanguage || "English",
           attachments,
@@ -601,9 +606,11 @@ function App() {
             busy={busy}
             hasKey={state.hasOpenRouterKey}
             model={selectedModel}
+            reasoningEffort={state.settings.reasoningEffort || "medium"}
             sourceLanguage={state.settings.sourceLanguage || "Auto"}
             targetLanguage={state.settings.targetLanguage || "English"}
             onLanguage={(patch) => setSetting(patch)}
+            onReasoningEffort={(reasoningEffort) => setSetting({ reasoningEffort })}
             onChooseModel={() => setModal("model")}
             onAttachPage={() => state.page && addAttachment({ type: "page", id: state.page.id, name: state.page.file_name })}
             onAttachSelection={() => selectedCrop && addAttachment({ type: "crop", id: selectedCrop.id, name: selectedCrop.name || selectedCrop.label })}
@@ -943,12 +950,12 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
   const queueIndex = useMemo(() => new Map(queue.map((crop, index) => [crop.id, index])), [queue]);
   const visibleRows = scratchpad.filter((entry) => {
     if (filter === "queue") return queue.some((crop) => crop.label === entry.label);
-    if (filter === "draft") return entry.draft && !entry.final;
-    if (filter === "final") return entry.final;
+    if (filter === "draft") return entry.draft && !entry.confirmed;
+    if (filter === "final") return entry.confirmed;
     return true;
   });
-  const draftCount = scratchpad.filter((row) => row.draft && !row.final).length;
-  const finalCount = scratchpad.filter((row) => row.final).length;
+  const draftCount = scratchpad.filter((row) => row.draft && !row.confirmed).length;
+  const finalCount = scratchpad.filter((row) => row.confirmed).length;
   return (
     <aside className="workbench">
       <div className="panel-header">
@@ -956,7 +963,6 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
         <div className="hstack mini">
           <button className="btn icon sm ghost" aria-pressed={view === "text"} onClick={() => setView("text")} title="Text list view" aria-label="Text list view"><Icon name="queue" /></button>
           <button className="btn icon sm ghost" aria-pressed={view === "card"} onClick={() => setView("card")} title="Card view" aria-label="Card view"><Icon name="grid" /></button>
-          <button className="btn icon sm ghost" onClick={onDecisions} title="Project decisions" aria-label="Project decisions"><Icon name="book" /></button>
         </div>
       </div>
       <div className="filter-row">
@@ -1075,43 +1081,53 @@ function CropInspector({ crop, queuedIndex, queueTotal, focusCropId, onFocusCons
 }
 
 function ScratchSummary({ row }) {
+  const type = normalizeLineType(row.type, row.label);
   return (
     <>
-      <span className={classNames("pill dot", row.type)}>{row.label}</span>
+      <span className={classNames("pill dot", type)}>{row.label}</span>
       <span className="truncate">{row.final || row.draft || "No translation yet"}</span>
       <small>{row.source || ""}</small>
-      {row.final && <Icon name="check" className="success" />}
+      {Boolean(row.confirmed) && <Icon name="check" className="success" />}
     </>
   );
 }
 
 function EntryEditor({ entry, onSave, onDelete, onAsk }) {
   const [draft, setDraft] = useState(entry || {});
+  const saveDraft = async (patch = {}) => {
+    if (!entry) return;
+    const next = { ...draft, ...patch, id: entry.id };
+    setDraft(next);
+    await onSave(next);
+  };
   useEffect(() => setDraft(entry || {}), [entry?.id]);
   if (!entry) return <div className="entry-editor quiet">Select or create a scratchpad line.</div>;
   const update = (patch) => setDraft((value) => ({ ...value, ...patch }));
+  const dirty = ["label", "type", "source", "draft", "final", "notes", "confirmed"].some((key) => String(draft[key] ?? "") !== String(entry[key] ?? ""));
+  const confirmed = Boolean(draft.confirmed);
   return (
-    <form className="entry-editor mt-scroll" onSubmit={(e) => { e.preventDefault(); onSave(draft); }}>
+    <form className="entry-editor mt-scroll" onSubmit={(e) => { e.preventDefault(); saveDraft({ confirmed: confirmed ? 0 : 1 }); }}>
       <div className="editor-head">
-        <input value={draft.label || ""} onChange={(e) => update({ label: e.target.value, type: labelType(e.target.value) })} />
-        <select value={draft.type || "speech"} onChange={(e) => update({ type: e.target.value })}><option value="speech">speech</option><option value="sfx">sfx</option><option value="narration">narration</option></select>
+        <input value={draft.label || ""} onChange={(e) => update({ label: e.target.value, type: labelType(e.target.value) })} onBlur={() => dirty && saveDraft()} />
+        <select value={draft.type || "speech"} onChange={(e) => saveDraft({ type: e.target.value })}><option value="speech">speech</option><option value="sfx">sfx</option><option value="narration">narration</option></select>
         <button type="button" className="btn icon sm ghost" onClick={() => onAsk(entry)} title="Ask about this line" aria-label="Ask about this line"><Icon name="chat" /></button>
         <button type="button" className="btn icon sm ghost" onClick={() => onDelete(entry)} title="Delete line" aria-label="Delete line"><Icon name="trash" /></button>
       </div>
-      <label>Source <textarea value={draft.source || ""} onChange={(e) => update({ source: e.target.value })} /></label>
-      <label>Draft <textarea value={draft.draft || ""} onChange={(e) => update({ draft: e.target.value })} /></label>
-      <label>Final <textarea className="final" value={draft.final || ""} onChange={(e) => update({ final: e.target.value })} /></label>
-      <label>Notes <textarea value={draft.notes || ""} onChange={(e) => update({ notes: e.target.value })} /></label>
+      <label>Source <textarea value={draft.source || ""} onChange={(e) => update({ source: e.target.value })} onBlur={() => dirty && saveDraft()} /></label>
+      <label>Draft <textarea value={draft.draft || ""} onChange={(e) => update({ draft: e.target.value })} onBlur={() => dirty && saveDraft()} /></label>
+      <label>Final <textarea className="final" value={draft.final || ""} onChange={(e) => update({ final: e.target.value, confirmed: 0 })} onBlur={() => dirty && saveDraft()} /></label>
+      <label>Notes <textarea value={draft.notes || ""} onChange={(e) => update({ notes: e.target.value })} onBlur={() => dirty && saveDraft()} /></label>
       <div className="hstack">
-        <button type="button" className="btn sm ghost" onClick={() => update({ final: draft.draft || "" })}><Icon name="copy" /> Copy draft to final</button>
+        <button type="button" className="btn sm ghost" onClick={() => saveDraft({ final: draft.draft || "", confirmed: 0 })}><Icon name="copy" /> Copy draft to final</button>
         <span className="spacer" />
-        <button className="btn primary sm"><Icon name="check" /> Save</button>
+        {dirty && <button type="button" className="btn sm ghost" onClick={() => saveDraft()}>Save edits</button>}
+        <button className={classNames("btn sm", confirmed ? "ghost" : "primary")}><Icon name={confirmed ? "close" : "check"} /> {confirmed ? "Unconfirm" : "Confirm"}</button>
       </div>
     </form>
   );
 }
 
-function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attachments, setAttachments, crops, queue, page, selectedCrop, decisions, text, setText, busy, hasKey, model, sourceLanguage, targetLanguage, onLanguage, onChooseModel, onAttachPage, onAttachSelection, hasSelection, onAttachQueue, onFillPrompt, onGuide, onNewSession, onSelectSession, onRenameSession, onClearChat, onSubmit }) {
+function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attachments, setAttachments, crops, queue, page, selectedCrop, decisions, text, setText, busy, hasKey, model, reasoningEffort, sourceLanguage, targetLanguage, onLanguage, onReasoningEffort, onChooseModel, onAttachPage, onAttachSelection, hasSelection, onAttachQueue, onFillPrompt, onGuide, onNewSession, onSelectSession, onRenameSession, onClearChat, onSubmit }) {
   const pageAttached = Boolean(page && attachments.some((item) => item.type === "page" && item.id === page.id));
   const attachedCropIds = new Set(attachments.filter((item) => item.type === "crop").map((item) => item.id));
   const selectionAttached = Boolean(selectedCrop && attachedCropIds.has(selectedCrop.id));
@@ -1140,7 +1156,7 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         <div className="hstack"><Icon name="chat" /><b>Translation chat</b><span className="pill">auto-saved</span></div>
       </div>
       <div className="chat-pass-row">
-        <span>Pass</span>
+        <span>Chats</span>
         {editingSessionId === activeChatSessionId ? (
           <form className="chat-session-editor" onSubmit={commitRename}>
             <input value={sessionTitle} onChange={(e) => setSessionTitle(e.target.value)} onKeyDown={(e) => { if (e.key === "Escape") setEditingSessionId(""); }} autoFocus />
@@ -1161,6 +1177,12 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         <Icon name="chevronRight" />
         <select value={targetLanguage} onChange={(e) => onLanguage({ targetLanguage: e.target.value })}>{LANGUAGES.filter((l) => l !== "Auto").map((lang) => <option key={lang}>{lang}</option>)}</select>
         <button className="btn sm ghost model-select" onClick={onChooseModel}><Icon name="sparkle" /> {modelLabel(model)}</button>
+        <label className="reasoning-select" title="OpenRouter reasoning effort">
+          <span>Think</span>
+          <select value={reasoningEffort} onChange={(e) => onReasoningEffort(e.target.value)}>
+            {REASONING_EFFORTS.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+          </select>
+        </label>
       </div>
       <div className="context-row">
         <span>Attached</span>
@@ -1227,7 +1249,7 @@ function Message({ message, models }) {
 }
 
 function MessageBody({ content, isAssistant }) {
-  const blocks = isAssistant ? parseAssistantBlocks(content) : [];
+  const { blocks, remainder } = isAssistant ? parseAssistantContent(content) : { blocks: [], remainder: "" };
   if (blocks.length >= 2) {
     return (
       <div className="assistant-blocks">
@@ -1239,48 +1261,64 @@ function MessageBody({ content, isAssistant }) {
             {block.notes && <p><strong>Notes</strong>{block.notes}</p>}
           </section>
         ))}
+        {remainder && <MarkdownBubble content={remainder} />}
       </div>
     );
   }
-  return <div className="message-bubble">{renderLightMarkdown(content)}</div>;
+  return <MarkdownBubble content={content} />;
 }
 
-function parseAssistantBlocks(content = "") {
+function MarkdownBubble({ content }) {
+  return (
+    <div className="message-bubble markdown-body">
+      <Streamdown>{String(content || "")}</Streamdown>
+    </div>
+  );
+}
+
+function parseAssistantContent(content = "") {
   const lines = String(content).split(/\r?\n/);
   const blocks = [];
   let current = null;
+  let activeField = "";
+  let remainderStart = lines.length;
   const commit = () => {
     if (current && (current.source || current.draft || current.notes || current.type)) blocks.push(current);
   };
-  for (const rawLine of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index];
     const line = rawLine.trim();
     const match = line.match(/^(?:[-*]\s*)?(?:\*\*)?Label(?:\*\*)?\s*:\s*(SFX\d+|S\d+|N\d+)/i);
     if (match) {
       commit();
       current = { label: match[1].toUpperCase(), type: "", source: "", draft: "", notes: "" };
+      activeField = "";
       continue;
     }
     if (!current) continue;
     const field = line.match(/^(?:[-*]\s*)?(?:\*\*)?(Type|Source|Draft|Notes?)(?:\*\*)?\s*:\s*(.*)$/i);
     if (!field) {
-      if (line && current.notes) current.notes += ` ${stripMarkdown(line)}`;
-      continue;
+      if (!line) continue;
+      if (activeField && /^\s+/.test(rawLine)) {
+        current[activeField] = `${current[activeField]} ${stripMarkdown(line)}`.trim();
+        continue;
+      }
+      remainderStart = index;
+      break;
     }
-    const key = field[1].toLowerCase().replace("note", "notes");
+    const key = field[1].toLowerCase().replace(/^note$/, "notes");
     current[key] = stripMarkdown(field[2]);
+    activeField = key;
   }
   commit();
-  return blocks;
+  return {
+    blocks,
+    remainder: lines.slice(remainderStart).join("\n").trim(),
+  };
 }
 
-function renderLightMarkdown(content = "") {
-  return String(content).split(/\r?\n/).map((line, index) => {
-    const clean = stripMarkdown(line);
-    if (!clean) return <br key={index} />;
-    const heading = line.match(/^#{1,4}\s+(.+)$/);
-    if (heading) return <strong key={index} className="md-heading">{stripMarkdown(heading[1])}</strong>;
-    return <React.Fragment key={index}>{clean}{index < String(content).split(/\r?\n/).length - 1 ? "\n" : ""}</React.Fragment>;
-  });
+function parseAssistantBlocks(content = "") {
+  return parseAssistantContent(content).blocks;
 }
 
 function stripMarkdown(value = "") {
@@ -1527,6 +1565,14 @@ function labelType(label = "") {
   if (up.startsWith("SFX")) return "sfx";
   if (up.startsWith("N")) return "narration";
   return "speech";
+}
+
+function normalizeLineType(type = "", label = "") {
+  const value = String(type || "").toLowerCase();
+  if (["speech", "dialogue", "dialog", "spoken"].includes(value)) return "speech";
+  if (["sfx", "sound effect", "sound_effect", "sound-effect", "onomatopoeia"].includes(value)) return "sfx";
+  if (["narration", "narrative", "caption", "narrator"].includes(value)) return "narration";
+  return labelType(label);
 }
 
 function nextCropLabel(crops) {

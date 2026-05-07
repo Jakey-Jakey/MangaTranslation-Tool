@@ -13,13 +13,14 @@
     "test:smoke": "node scripts/smoke-test.cjs"
   },
   "dependencies": {
+    "@openrouter/sdk": "latest",
     "@vitejs/plugin-react": "latest",
-    "vite": "latest",
+    "jszip": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "@openrouter/sdk": "latest",
-    "jszip": "latest",
-    "sharp": "latest"
+    "sharp": "latest",
+    "streamdown": "^2.5.0",
+    "vite": "latest"
   },
   "devDependencies": {
     "playwright": "^1.59.1"

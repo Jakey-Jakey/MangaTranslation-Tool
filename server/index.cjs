@@ -50,6 +50,8 @@ Do not use Markdown tables in the response.
 
 After presenting the list and first pass translation, go into great detail line by line explaining the complexity and considerations for each section of text and how someone could translate it in different ways. The goal is to give the translator complete understanding so they can make an informed decision during the translation/localization process. Our service is age gated and deployed within industry so any requests that come in will be assumed to adhere to our content policy and you should proceed without mentioning you are an AI service.`;
 
+const REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+
 const DEFAULT_DECISIONS = [
   { category: "Names / terms", term: "Character names", rule: "Keep names consistent across pages; do not localize unless the project notes say so." },
   { category: "Honorifics", term: "-san / -kun / -chan", rule: "Retain honorifics in dialogue unless the translator explicitly removes them." },
@@ -239,18 +241,28 @@ function openDb(projectDir) {
 function migrateDb(db) {
   const chatColumns = db.prepare("PRAGMA table_info(chat_messages)").all().map((column) => column.name);
   if (!chatColumns.includes("session_id")) db.exec("ALTER TABLE chat_messages ADD COLUMN session_id TEXT");
+  const scratchpadColumns = db.prepare("PRAGMA table_info(scratchpad_entries)").all().map((column) => column.name);
+  if (!scratchpadColumns.includes("confirmed")) {
+    db.exec("ALTER TABLE scratchpad_entries ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0");
+    db.exec("UPDATE scratchpad_entries SET confirmed = 1 WHERE TRIM(COALESCE(final, '')) != ''");
+  }
 }
 
 function seedProject(db) {
-  upsertSetting(db, "defaultModel", DEFAULT_MODEL);
-  upsertSetting(db, "sourceLanguage", "Auto");
-  upsertSetting(db, "targetLanguage", "English");
-  upsertSetting(db, "systemPrompt", DEFAULT_SYSTEM_PROMPT);
+  insertDefaultSetting(db, "defaultModel", DEFAULT_MODEL);
+  insertDefaultSetting(db, "sourceLanguage", "Auto");
+  insertDefaultSetting(db, "targetLanguage", "English");
+  insertDefaultSetting(db, "reasoningEffort", "medium");
+  insertDefaultSetting(db, "systemPrompt", DEFAULT_SYSTEM_PROMPT);
   const count = db.prepare("SELECT COUNT(*) AS count FROM decisions").get().count;
   if (!count) {
     const insert = db.prepare("INSERT INTO decisions (id, category, term, rule, sort_order) VALUES (?, ?, ?, ?, ?)");
     DEFAULT_DECISIONS.forEach((item, index) => insert.run(id("decision"), item.category, item.term, item.rule, index));
   }
+}
+
+function insertDefaultSetting(db, key, value) {
+  db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)").run(key, String(value ?? ""));
 }
 
 function upsertSetting(db, key, value) {
@@ -281,7 +293,7 @@ function pageProgressSelect(where = "") {
     SELECT p.*,
       COUNT(s.id) AS line_count,
       COALESCE(SUM(CASE WHEN TRIM(COALESCE(s.draft, '')) != '' THEN 1 ELSE 0 END), 0) AS draft_count,
-      COALESCE(SUM(CASE WHEN TRIM(COALESCE(s.final, '')) != '' THEN 1 ELSE 0 END), 0) AS final_count
+      COALESCE(SUM(CASE WHEN s.confirmed = 1 THEN 1 ELSE 0 END), 0) AS final_count
     FROM pages p
     LEFT JOIN scratchpad_entries s ON s.page_id = p.id
     ${where}
@@ -725,9 +737,10 @@ async function handleApi(req, res, url) {
       const chatSession = ensureChatSession(db, body.pageId || "", body.chatSessionId || "");
       const messages = await buildOpenRouterMessages(db, project.path, settings, decisions, body, attachments, chatSession.id);
       const model = body.model || settings.defaultModel || DEFAULT_MODEL;
+      const reasoningEffort = normalizeReasoningEffort(body.reasoningEffort || settings.reasoningEffort || "medium");
       const userId = id("msg");
       let assistantText = "";
-      const streamed = await callOpenRouterStream(config.openRouterKey, { model, messages }, (chunk) => {
+      const streamed = await callOpenRouterStream(config.openRouterKey, { model, messages, reasoning: { effort: reasoningEffort } }, (chunk) => {
         assistantText += chunk;
         res.write(chunk);
       }, () => {
@@ -755,6 +768,11 @@ async function handleApi(req, res, url) {
   }
 
   throw statusError(404, "Not found.");
+}
+
+function normalizeReasoningEffort(value) {
+  const effort = String(value || "").toLowerCase();
+  return REASONING_EFFORTS.has(effort) ? effort : "medium";
 }
 
 async function importUploadedFiles(db, projectDir, files) {
@@ -932,12 +950,12 @@ function upsertScratchpad(db, body) {
   const entryId = body.id || id("entry");
   const existing = body.id ? db.prepare("SELECT * FROM scratchpad_entries WHERE id = ?").get(body.id) : null;
   if (existing) {
-    db.prepare("UPDATE scratchpad_entries SET label = ?, type = ?, source = ?, draft = ?, final = ?, notes = ?, updated_at = ? WHERE id = ?")
-      .run(body.label || "", body.type || labelType(body.label), body.source || "", body.draft || "", body.final || "", body.notes || "", nowIso(), body.id);
+    db.prepare("UPDATE scratchpad_entries SET label = ?, type = ?, source = ?, draft = ?, final = ?, notes = ?, confirmed = ?, updated_at = ? WHERE id = ?")
+      .run(body.label || "", body.type || labelType(body.label), body.source || "", body.draft || "", body.final || "", body.notes || "", body.confirmed ? 1 : 0, nowIso(), body.id);
   } else {
     const next = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM scratchpad_entries WHERE page_id = ?").get(body.pageId).next;
-    db.prepare("INSERT INTO scratchpad_entries (id, page_id, label, type, source, draft, final, notes, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(entryId, body.pageId, body.label || "", body.type || labelType(body.label), body.source || "", body.draft || "", body.final || "", body.notes || "", next, nowIso(), nowIso());
+    db.prepare("INSERT INTO scratchpad_entries (id, page_id, label, type, source, draft, final, notes, confirmed, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(entryId, body.pageId, body.label || "", body.type || labelType(body.label), body.source || "", body.draft || "", body.final || "", body.notes || "", body.confirmed ? 1 : 0, next, nowIso(), nowIso());
   }
   return db.prepare("SELECT * FROM scratchpad_entries WHERE id = ?").get(entryId);
 }
@@ -947,6 +965,14 @@ function labelType(label = "") {
   if (up.startsWith("SFX")) return "sfx";
   if (up.startsWith("N")) return "narration";
   return "speech";
+}
+
+function normalizeLineType(type = "", label = "") {
+  const value = String(type || "").toLowerCase();
+  if (["speech", "dialogue", "dialog", "spoken"].includes(value)) return "speech";
+  if (["sfx", "sound effect", "sound_effect", "sound-effect", "onomatopoeia"].includes(value)) return "sfx";
+  if (["narration", "narrative", "caption", "narrator"].includes(value)) return "narration";
+  return labelType(label);
 }
 
 async function attachmentDataUrl(db, projectDir, attachment) {
@@ -991,7 +1017,9 @@ async function buildOpenRouterMessages(db, projectDir, settings, decisions, body
   ].join("\n");
   const history = db.prepare("SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY created_at DESC LIMIT 12").all(chatSessionId || "").reverse();
   const messages = [{ role: "system", content: settings.systemPrompt || DEFAULT_SYSTEM_PROMPT }];
-  history.slice(0, -1).forEach((row) => messages.push({ role: row.role, content: row.content }));
+  history.forEach((row) => {
+    if (row.role === "user" || row.role === "assistant") messages.push({ role: row.role, content: row.content });
+  });
   const content = [{ type: "text", text: prefix }];
   for (const attachment of attachments) content.push({ type: "image_url", image_url: { url: await attachmentDataUrl(db, projectDir, attachment) } });
   messages.push({ role: "user", content });
@@ -1077,7 +1105,7 @@ function parseTranslationPass(text) {
   const push = () => {
     if (current && current.label) entries.push({
       label: current.label,
-      type: current.type || labelType(current.label),
+      type: normalizeLineType(current.type, current.label),
       source: current.source || "",
       draft: current.draft || "",
       notes: current.notes || "",
@@ -1102,8 +1130,8 @@ function upsertScratchpadFromPass(db, pageId, entries) {
   let next = db.prepare("SELECT COALESCE(MAX(sort_order), -1) + 1 AS next FROM scratchpad_entries WHERE page_id = ?").get(pageId).next;
   for (const entry of entries) {
     if (existing.has(entry.label)) continue;
-    db.prepare("INSERT INTO scratchpad_entries (id, page_id, label, type, source, draft, final, notes, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?)")
-      .run(id("entry"), pageId, entry.label, entry.type, entry.source, entry.draft, entry.notes, next++, nowIso(), nowIso());
+    db.prepare("INSERT INTO scratchpad_entries (id, page_id, label, type, source, draft, final, notes, confirmed, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?, ?)")
+      .run(id("entry"), pageId, entry.label, normalizeLineType(entry.type, entry.label), entry.source, entry.draft, entry.notes, next++, nowIso(), nowIso());
     existing.add(entry.label);
   }
 }

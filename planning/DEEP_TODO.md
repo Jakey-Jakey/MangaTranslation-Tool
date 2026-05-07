@@ -65,6 +65,7 @@
 - [x] Copy draft to final.
 - [x] Delete with confirmation.
 - [x] Ask about selected line by adding contextual prompt.
+- [ ] Make the Workbench and chat panels horizontally adjustable with draggable splitters.
 
 ## 9. Chat And Translation Flow
 - [x] Persist chat messages.
