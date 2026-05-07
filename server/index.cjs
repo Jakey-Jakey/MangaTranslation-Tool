@@ -1462,9 +1462,19 @@ async function exportJson(db, projectDir, body) {
     pages: pages.map((page) => ({
       ...page,
       crops: body.include?.boxes === false ? undefined : getCrops(db, page.id),
-      scratchpad: getScratchpad(db, page.id),
+      scratchpad: getScratchpad(db, page.id).map((row) => ({
+        ...row,
+        source: body.include?.source === false ? undefined : row.source,
+        draft: body.include?.draft === false ? undefined : row.draft,
+        final: body.include?.final === false ? undefined : row.final,
+        notes: body.include?.notes === false ? undefined : row.notes,
+      })),
       translations: db.prepare("SELECT * FROM translation_entries WHERE page_id = ? ORDER BY sort_order, label").all(page.id).map((entry) => ({
         ...entry,
+        source: body.include?.source === false ? undefined : entry.source,
+        draft: body.include?.draft === false ? undefined : entry.draft,
+        final: body.include?.final === false ? undefined : entry.final,
+        notes: body.include?.notes === false ? undefined : entry.notes,
         crop_ids: JSON.parse(entry.crop_ids_json || "[]"),
         crop_ids_json: undefined,
       })),
