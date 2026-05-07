@@ -23,22 +23,40 @@ if errorlevel 1 (
   exit /b 1
 )
 
+for %%I in ("%NODE_EXE%") do set "NODE_DIR=%%~dpI"
+set "NPM_CMD="
+set "NPM_CLI="
+if exist "%NODE_DIR%npm.cmd" set "NPM_CMD=%NODE_DIR%npm.cmd"
+if exist "%NODE_DIR%node_modules\npm\bin\npm-cli.js" set "NPM_CLI=%NODE_DIR%node_modules\npm\bin\npm-cli.js"
+
 if not exist node_modules (
-  where npm >nul 2>nul
-  if errorlevel 1 (
-    echo npm was not found on PATH, and node_modules is missing.
-    echo Install Node.js with npm enabled, then run this file again.
+  if not defined NPM_CMD if not defined NPM_CLI (
+    echo npm was not found next to the selected Node.js install, and node_modules is missing.
+    echo Reinstall Node.js with npm enabled, then run this file again.
     pause
     exit /b 1
   )
-  call npm install
+  if defined NPM_CMD (
+    call "%NPM_CMD%" install
+  ) else (
+    "%NODE_EXE%" "%NPM_CLI%" install
+  )
   if errorlevel 1 goto failed
 )
 
 if exist node_modules\vite\bin\vite.js (
   "%NODE_EXE%" node_modules\vite\bin\vite.js build
 ) else (
-  call npm run build
+  if defined NPM_CMD (
+    call "%NPM_CMD%" run build
+  ) else if defined NPM_CLI (
+    "%NODE_EXE%" "%NPM_CLI%" run build
+  ) else (
+    echo npm was not found next to the selected Node.js install, and Vite is not installed locally.
+    echo Reinstall dependencies with Node.js/npm, then run this file again.
+    pause
+    exit /b 1
+  )
 )
 if errorlevel 1 goto failed
 

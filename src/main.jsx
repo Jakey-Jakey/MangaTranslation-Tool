@@ -120,8 +120,8 @@ function progressCounts(page) {
 function progressLabel(page) {
   const { total, drafted, final } = progressCounts(page);
   if (!total) return "No lines";
-  if (drafted >= total) return `Final ${final}/${total}`;
   if (final >= total) return `Final ${final}/${total}`;
+  if (drafted >= total) return `Final ${final}/${total}`;
   return `Drafted ${drafted}/${total} · Final ${final}/${total}`;
 }
 
@@ -1094,11 +1094,24 @@ function ScratchSummary({ row }) {
 
 function EntryEditor({ entry, onSave, onDelete, onAsk }) {
   const [draft, setDraft] = useState(entry || {});
+  const pendingSaves = useRef(new Map());
+  const waitForPendingSave = async (entryId) => {
+    const pending = pendingSaves.current.get(entryId);
+    if (pending) await pending.catch(() => {});
+  };
   const saveDraft = async (patch = {}) => {
     if (!entry) return;
-    const next = { ...draft, ...patch, id: entry.id };
+    const entryId = entry.id;
+    const next = { ...draft, ...patch, id: entryId };
     setDraft(next);
-    await onSave(next);
+    const previous = pendingSaves.current.get(entryId) || Promise.resolve();
+    const savePromise = previous.catch(() => {}).then(() => onSave(next));
+    pendingSaves.current.set(entryId, savePromise);
+    try {
+      await savePromise;
+    } finally {
+      if (pendingSaves.current.get(entryId) === savePromise) pendingSaves.current.delete(entryId);
+    }
   };
   useEffect(() => setDraft(entry || {}), [entry?.id]);
   if (!entry) return <div className="entry-editor quiet">Select or create a scratchpad line.</div>;
@@ -1106,12 +1119,12 @@ function EntryEditor({ entry, onSave, onDelete, onAsk }) {
   const dirty = ["label", "type", "source", "draft", "final", "notes", "confirmed"].some((key) => String(draft[key] ?? "") !== String(entry[key] ?? ""));
   const confirmed = Boolean(draft.confirmed);
   return (
-    <form className="entry-editor mt-scroll" onSubmit={(e) => { e.preventDefault(); saveDraft({ confirmed: confirmed ? 0 : 1 }); }}>
+    <form className="entry-editor mt-scroll" onSubmit={async (e) => { e.preventDefault(); await saveDraft({ confirmed: confirmed ? 0 : 1 }); }}>
       <div className="editor-head">
         <input value={draft.label || ""} onChange={(e) => update({ label: e.target.value, type: labelType(e.target.value) })} onBlur={() => dirty && saveDraft()} />
         <select value={draft.type || "speech"} onChange={(e) => saveDraft({ type: e.target.value })}><option value="speech">speech</option><option value="sfx">sfx</option><option value="narration">narration</option></select>
         <button type="button" className="btn icon sm ghost" onClick={() => onAsk(entry)} title="Ask about this line" aria-label="Ask about this line"><Icon name="chat" /></button>
-        <button type="button" className="btn icon sm ghost" onClick={() => onDelete(entry)} title="Delete line" aria-label="Delete line"><Icon name="trash" /></button>
+        <button type="button" className="btn icon sm ghost" onClick={async () => { await waitForPendingSave(entry.id); await onDelete(entry); }} title="Delete line" aria-label="Delete line"><Icon name="trash" /></button>
       </div>
       <label>Source <textarea value={draft.source || ""} onChange={(e) => update({ source: e.target.value })} onBlur={() => dirty && saveDraft()} /></label>
       <label>Draft <textarea value={draft.draft || ""} onChange={(e) => update({ draft: e.target.value })} onBlur={() => dirty && saveDraft()} /></label>
