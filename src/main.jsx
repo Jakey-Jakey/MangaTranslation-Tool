@@ -1,10 +1,21 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { api, fileUrl } from "./api/client.js";
+import { parseAssistantContent } from "./parsers/assistantOutput.js";
 import "./styles.css";
+
+const Streamdown = React.lazy(() => import("streamdown").then((module) => ({ default: module.Streamdown })));
 
 const DEFAULT_MODEL = "google/gemini-3.1-pro-preview";
 const LANGUAGES = ["Auto", "Japanese", "Korean", "Chinese", "English", "Spanish", "French", "German", "Italian", "Portuguese"];
+const REASONING_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh"];
 const GUIDE_SECTIONS = ["Character names", "Honorifics", "Recurring terms", "Tone", "SFX treatment"];
+const PASS_TEMPLATES = [
+  { id: "full-page", label: "Full page", title: "Full page pass", prompt: "Analyze the full attached page. Produce the structured translation pass first, then detailed line-by-line localization notes." },
+  { id: "crop-queue", label: "Crop queue", title: "Crop queue pass", prompt: "Analyze the attached crop queue in order. Preserve the crop order and produce one structured item per visible text region." },
+  { id: "line-refine", label: "Line refine", title: "Line refinement pass", prompt: "Focus on the selected line or crop. Give alternative translations, explain nuance, and recommend a polished final wording." },
+  { id: "terms", label: "Terminology", title: "Terminology pass", prompt: "Extract names, recurring terms, honorific choices, SFX handling notes, and style-guide rules worth adding to the Project Guide." },
+];
 
 const iconPaths = {
   logo: "M4 4h16v16H4z M8 8h8v2H8z M8 12h8v2H8z M8 16h5v2H8z",
@@ -53,25 +64,12 @@ function Icon({ name, size = 14, className = "" }) {
   );
 }
 
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-  });
-  const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(data.error || response.statusText);
-  return data;
-}
-
-function fileUrl(relativePath, cacheKey = "") {
-  const params = new URLSearchParams({ path: relativePath || "" });
-  if (cacheKey) params.set("v", cacheKey);
-  return `/api/file?${params.toString()}`;
-}
-
 function classNames(...items) {
   return items.filter(Boolean).join(" ");
+}
+
+function clampPanelWidth(value) {
+  return Math.max(280, Math.min(620, Math.round(Number(value) || 340)));
 }
 
 function pathTail(value) {
@@ -118,6 +116,8 @@ function progressCounts(page) {
 function progressLabel(page) {
   const { total, drafted, final } = progressCounts(page);
   if (!total) return "No lines";
+  if (final >= total) return `Final ${final}/${total}`;
+  if (drafted >= total) return `Final ${final}/${total}`;
   return `Drafted ${drafted}/${total} · Final ${final}/${total}`;
 }
 
@@ -166,6 +166,7 @@ function App() {
   const [workbenchFilter, setWorkbenchFilter] = useState("all");
   const [modal, setModal] = useState("");
   const [toast, setToast] = useState("");
+  const [dialog, setDialog] = useState(null);
   const [busy, setBusy] = useState(false);
   const [chatText, setChatText] = useState("");
   const [attachments, setAttachments] = useState([]);
@@ -173,13 +174,41 @@ function App() {
   const [visionOnly, setVisionOnly] = useState(true);
   const [importStatus, setImportStatus] = useState("");
   const [undoStack, setUndoStack] = useState([]);
+  const [redoStack, setRedoStack] = useState([]);
   const [labelFocusCropId, setLabelFocusCropId] = useState("");
+  const [panelWidths, setPanelWidths] = useState({ workbench: 340, chat: 360 });
+  const [panelDrag, setPanelDrag] = useState(null);
 
   const showToast = (message) => {
     setToast(message);
     window.clearTimeout(showToast.timer);
     showToast.timer = window.setTimeout(() => setToast(""), 4200);
   };
+
+  const confirmAction = ({ title, message, confirmLabel = "Confirm", danger = false }) => new Promise((resolve) => {
+    setDialog({
+      type: "confirm",
+      title,
+      message,
+      confirmLabel,
+      danger,
+      onCancel: () => { setDialog(null); resolve(false); },
+      onConfirm: () => { setDialog(null); resolve(true); },
+    });
+  });
+
+  const promptAction = ({ title, message, placeholder = "", confirmLabel = "Continue" }) => new Promise((resolve) => {
+    setDialog({
+      type: "prompt",
+      title,
+      message,
+      placeholder,
+      value: "",
+      confirmLabel,
+      onCancel: () => { setDialog(null); resolve(""); },
+      onConfirm: (value) => { setDialog(null); resolve(String(value || "").trim()); },
+    });
+  });
 
   const refresh = async ({ keepPage = false } = {}) => {
     const data = await api("/api/status");
@@ -219,6 +248,17 @@ function App() {
     setAttachments([]);
   };
 
+  const createTemplateSession = async (template) => {
+    if (!state.page || !template) return;
+    const data = await api("/api/chat/session", { method: "POST", body: JSON.stringify({ pageId: state.page.id, title: template.title }) });
+    setState((s) => ({ ...s, chatSessions: data.chatSessions, activeChatSessionId: data.activeChatSessionId, messages: data.messages || [] }));
+    setChatText(template.prompt);
+    setAttachments([]);
+    if (template.id === "full-page") addAttachment({ type: "page", id: state.page.id, name: state.page.file_name });
+    if (template.id === "crop-queue") setAttachments(state.queue.map((crop) => ({ type: "crop", id: crop.id, name: crop.name || crop.label })));
+    if (template.id === "line-refine" && selectedCrop) addAttachment({ type: "crop", id: selectedCrop.id, name: selectedCrop.name || selectedCrop.label });
+  };
+
   const selectChatSession = async (sessionId) => {
     if (!state.page || !sessionId || sessionId === state.activeChatSessionId) return;
     const data = await api("/api/chat/session/select", { method: "POST", body: JSON.stringify({ pageId: state.page.id, sessionId }) });
@@ -232,6 +272,22 @@ function App() {
     setState((s) => ({ ...s, chatSessions: data.chatSessions, activeChatSessionId: data.activeChatSessionId, messages: data.messages || s.messages }));
   };
 
+  const archiveChatSession = async (session) => {
+    if (!session || !(await confirmAction({ title: "Archive Pass", message: `Archive ${session.title || "this chat pass"}?`, confirmLabel: "Archive" }))) return;
+    const data = await api("/api/chat/session/archive", { method: "POST", body: JSON.stringify({ sessionId: session.id }) });
+    setState((s) => ({ ...s, chatSessions: data.chatSessions, activeChatSessionId: data.activeChatSessionId, messages: data.messages || [] }));
+    setAttachments([]);
+    showToast("Chat pass archived.");
+  };
+
+  const deleteChatSession = async (session) => {
+    if (!session || !(await confirmAction({ title: "Delete Pass", message: `Delete ${session.title || "this chat pass"}? Scratchpad text will be kept.`, confirmLabel: "Delete", danger: true }))) return;
+    const data = await api("/api/chat/session/delete", { method: "POST", body: JSON.stringify({ sessionId: session.id }) });
+    setState((s) => ({ ...s, chatSessions: data.chatSessions, activeChatSessionId: data.activeChatSessionId, messages: data.messages || [] }));
+    setAttachments([]);
+    showToast("Chat pass deleted.");
+  };
+
   useEffect(() => {
     refresh().catch((error) => showToast(error.message));
     api("/api/models").then((data) => setState((s) => ({ ...s, models: data.data || [] }))).catch(() => {});
@@ -241,6 +297,24 @@ function App() {
     if (!state.activeProject) setModal("onboarding");
     else if (modal === "onboarding") setModal("");
   }, [state.activeProject]);
+
+  useEffect(() => {
+    if (!panelDrag) return;
+    const onPointerMove = (event) => {
+      const delta = panelDrag.startX - event.clientX;
+      setPanelWidths({
+        workbench: panelDrag.kind === "workbench" ? clampPanelWidth(panelDrag.workbench + delta) : panelDrag.workbench,
+        chat: panelDrag.kind === "chat" ? clampPanelWidth(panelDrag.chat + delta) : panelDrag.chat,
+      });
+    };
+    const onPointerUp = () => setPanelDrag(null);
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    return () => {
+      window.removeEventListener("pointermove", onPointerMove);
+      window.removeEventListener("pointerup", onPointerUp);
+    };
+  }, [panelDrag]);
 
   const selectedCrop = state.crops.find((crop) => crop.id === selectedCropId) || null;
   const selectedEntry = state.scratchpad.find((entry) => entry.id === selectedEntryId) || state.scratchpad[0] || null;
@@ -258,10 +332,12 @@ function App() {
     setImportStatus("Reading files...");
     try {
       const payload = [];
-      for (const file of files) {
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        setImportStatus(`Reading ${index + 1}/${files.length}: ${file.webkitRelativePath || file.name}`);
         payload.push({ name: file.webkitRelativePath || file.name, dataUrl: await readFileDataUrl(file) });
       }
-      setImportStatus("Importing into project...");
+      setImportStatus(`Importing ${files.length} item${files.length === 1 ? "" : "s"} into project...`);
       const data = await api("/api/import/files", { method: "POST", body: JSON.stringify({ files: payload }) });
       setState((s) => ({ ...s, pages: data.pages }));
       const nextPage = data.pages.find((page) => page.id === state.page?.id) || data.pages[0];
@@ -276,9 +352,15 @@ function App() {
   };
 
   const importPath = async () => {
-    const sourcePath = window.prompt("Image, folder, ZIP, CBZ, CBR, or PDF path to import:");
+    const sourcePath = await promptAction({
+      title: "Import Path",
+      message: "Paste an image, folder, ZIP, CBZ, CBR, or PDF path to import.",
+      placeholder: "C:\\Manga\\chapter-01.cbz",
+      confirmLabel: "Import",
+    });
     if (!sourcePath) return;
     setBusy(true);
+    setImportStatus("Importing path into project...");
     try {
       const data = await api("/api/import/path", { method: "POST", body: JSON.stringify({ path: sourcePath }) });
       setState((s) => ({ ...s, pages: data.pages }));
@@ -289,7 +371,34 @@ function App() {
       showToast(error.message);
     } finally {
       setBusy(false);
+      setImportStatus("");
     }
+  };
+
+  const pushUndo = (action) => {
+    setUndoStack((items) => [...items, action].slice(-40));
+    setRedoStack([]);
+  };
+
+  const restoreCrop = async (crop) => {
+    if (!state.page || !crop) return null;
+    const label = crop.label || crop.name || nextCropLabel(state.crops);
+    const data = await api("/api/crops", {
+      method: "POST",
+      body: JSON.stringify({
+        pageId: state.page.id,
+        label,
+        name: crop.name || label,
+        type: crop.type || labelType(label),
+        x: crop.x,
+        y: crop.y,
+        width: crop.width,
+        height: crop.height,
+      }),
+    });
+    setState((s) => ({ ...s, queue: data.queue, crops: data.crops || s.crops }));
+    if (data.crop?.id) setSelectedCropId(data.crop.id);
+    return data.crop || null;
   };
 
   const createCrop = async (rect) => {
@@ -301,7 +410,7 @@ function App() {
       setState((s) => ({ ...s, crops: data.crops, queue: data.queue }));
       setSelectedCropId(data.crop?.id || "");
       setLabelFocusCropId(data.crop?.id || "");
-      if (data.crop) setUndoStack((items) => [...items, { type: "createCrop", crop: data.crop }].slice(-40));
+      if (data.crop) pushUndo({ type: "createCrop", crop: data.crop });
       showToast("Crop created. Rename it in the crop inspector.");
     } catch (error) {
       showToast(error.message);
@@ -319,11 +428,11 @@ function App() {
       pages: data.page ? s.pages.map((page) => page.id === data.page.id ? data.page : page) : s.pages,
       scratchpad: data.scratchpad,
     }));
-    if (data.entry?.id) setSelectedEntryId(data.entry.id);
+    if (!entry.id && data.entry?.id) setSelectedEntryId(data.entry.id);
   };
 
   const deleteScratchpad = async (entry) => {
-    if (!entry || !window.confirm(`Delete ${entry.label || "this line"} from the scratchpad?`)) return;
+    if (!entry || !(await confirmAction({ title: "Delete Line", message: `Delete ${entry.label || "this line"} from the scratchpad?`, confirmLabel: "Delete", danger: true }))) return;
     const data = await api("/api/scratchpad/remove", { method: "POST", body: JSON.stringify({ entryId: entry.id }) });
     setState((s) => ({
       ...s,
@@ -373,24 +482,26 @@ function App() {
     setState((s) => ({ ...s, queue: data.queue, crops: data.crops || s.crops }));
     setSelectedCropId(data.crop?.id || "");
     setLabelFocusCropId(data.crop?.id || "");
-    if (data.crop) setUndoStack((items) => [...items, { type: "createCrop", crop: data.crop }].slice(-40));
+    if (data.crop) pushUndo({ type: "createCrop", crop: data.crop });
     showToast("Duplicated crop.");
   };
 
   const updateCrop = async (crop, patch, options = {}) => {
-    if (options.recordUndo !== false) setUndoStack((items) => [...items, { type: "updateCrop", before: crop }].slice(-40));
+    const after = { ...crop, ...patch };
     const data = await api("/api/crops/update", { method: "POST", body: JSON.stringify({ cropId: crop.id, ...patch }) });
     setState((s) => ({ ...s, queue: data.queue, crops: data.crops || s.crops }));
     if (data.crop?.id) setSelectedCropId(data.crop.id);
+    if (options.recordUndo !== false) pushUndo({ type: "updateCrop", before: crop, after: data.crop || after });
   };
 
   const removeCrop = async (crop, options = {}) => {
     if (!crop) return;
-    if (options.confirm !== false && !window.confirm(`Delete crop ${crop.label || crop.name || "this crop"}?`)) return;
+    if (options.confirm !== false && !(await confirmAction({ title: "Delete Crop", message: `Delete crop ${crop.label || crop.name || "this crop"}?`, confirmLabel: "Delete", danger: true }))) return;
     const data = await api("/api/crops/remove", { method: "POST", body: JSON.stringify({ cropId: crop.id }) });
     setState((s) => ({ ...s, queue: data.queue, crops: data.crops || [] }));
     setSelectedCropId("");
     setAttachments((items) => items.filter((item) => item.id !== crop.id));
+    if (options.recordUndo !== false) pushUndo({ type: "deleteCrop", crop });
   };
 
   const deleteCrop = (crop) => removeCrop(crop);
@@ -400,7 +511,8 @@ function App() {
     if (!action) return showToast("Nothing to undo.");
     setUndoStack((items) => items.slice(0, -1));
     if (action.type === "createCrop") {
-      await removeCrop(action.crop, { confirm: false });
+      await removeCrop(action.crop, { confirm: false, recordUndo: false });
+      setRedoStack((items) => [...items, action].slice(-40));
       showToast("Undid crop placement.");
       return;
     }
@@ -414,16 +526,70 @@ function App() {
         width: action.before.width,
         height: action.before.height,
       }, { recordUndo: false });
+      setRedoStack((items) => [...items, action].slice(-40));
       showToast("Undid crop edit.");
+      return;
+    }
+    if (action.type === "deleteCrop") {
+      const restored = await restoreCrop(action.crop);
+      setRedoStack((items) => [...items, { ...action, crop: restored || action.crop }].slice(-40));
+      showToast("Restored deleted crop.");
+    }
+  };
+
+  const redoLast = async () => {
+    const action = redoStack.at(-1);
+    if (!action) return showToast("Nothing to redo.");
+    setRedoStack((items) => items.slice(0, -1));
+    if (action.type === "createCrop") {
+      const restored = await restoreCrop(action.crop);
+      if (restored) setUndoStack((items) => [...items, { type: "createCrop", crop: restored }].slice(-40));
+      showToast("Redid crop placement.");
+      return;
+    }
+    if (action.type === "updateCrop") {
+      await updateCrop(action.before, {
+        label: action.after.label,
+        name: action.after.name,
+        type: action.after.type,
+        x: action.after.x,
+        y: action.after.y,
+        width: action.after.width,
+        height: action.after.height,
+      }, { recordUndo: false });
+      setUndoStack((items) => [...items, action].slice(-40));
+      showToast("Redid crop edit.");
+      return;
+    }
+    if (action.type === "deleteCrop") {
+      await removeCrop(action.crop, { confirm: false, recordUndo: false });
+      setUndoStack((items) => [...items, action].slice(-40));
+      showToast("Redid crop deletion.");
     }
   };
 
   const clearChat = async (scope = "page") => {
     const text = scope === "project" ? "Clear all chat messages for this project?" : "Clear the current chat pass?";
-    if (!window.confirm(text)) return;
+    if (!(await confirmAction({ title: "Clear Chat", message: text, confirmLabel: "Clear", danger: true }))) return;
     const data = await api("/api/chat/clear", { method: "POST", body: JSON.stringify({ pageId: state.page?.id, sessionId: state.activeChatSessionId, scope }) });
     setState((s) => ({ ...s, chatSessions: data.chatSessions || s.chatSessions, activeChatSessionId: data.activeChatSessionId || s.activeChatSessionId, messages: data.messages || [] }));
     setAttachments([]);
+  };
+
+  const applyTranslationImport = async (message, undo = false) => {
+    if (!message?.id) return;
+    const data = await api(undo ? "/api/translation/unimport" : "/api/translation/import", {
+      method: "POST",
+      body: JSON.stringify({ chatMessageId: message.id }),
+    });
+    setState((s) => ({
+      ...s,
+      page: data.page || s.page,
+      pages: data.page ? s.pages.map((page) => page.id === data.page.id ? data.page : page) : s.pages,
+      scratchpad: data.scratchpad || s.scratchpad,
+      messages: data.messages || s.messages,
+    }));
+    showToast(undo ? `Removed ${data.removed || 0} imported line${data.removed === 1 ? "" : "s"} from scratchpad.` : `Sent ${data.imported || 0} line${data.imported === 1 ? "" : "s"} to scratchpad.`);
   };
 
   useEffect(() => {
@@ -433,7 +599,13 @@ function App() {
       if (target?.closest?.("input, textarea, select, [contenteditable='true']")) return;
       if ((event.metaKey || event.ctrlKey) && !event.altKey && key === "z") {
         event.preventDefault();
-        undoLast().catch((error) => showToast(error.message));
+        if (event.shiftKey) redoLast().catch((error) => showToast(error.message));
+        else undoLast().catch((error) => showToast(error.message));
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && key === "y") {
+        event.preventDefault();
+        redoLast().catch((error) => showToast(error.message));
         return;
       }
       if (event.metaKey || event.ctrlKey || event.altKey) return;
@@ -461,7 +633,7 @@ function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedCrop?.id, selectedCrop?.x, selectedCrop?.y, state.queue, undoStack]);
+  }, [selectedCrop?.id, selectedCrop?.x, selectedCrop?.y, state.queue, undoStack, redoStack]);
 
   const sendChat = async (event) => {
     event?.preventDefault();
@@ -484,6 +656,7 @@ function App() {
           chatSessionId: state.activeChatSessionId,
           message,
           model: state.selectedModel,
+          reasoningEffort: state.settings.reasoningEffort || "medium",
           sourceLanguage: state.settings.sourceLanguage || "Auto",
           targetLanguage: state.settings.targetLanguage || "English",
           attachments,
@@ -537,7 +710,7 @@ function App() {
         onAccount={() => setModal("account")}
       />
       {mode === "translation" ? (
-        <main className="translation-layout">
+        <main className={classNames("translation-layout", panelDrag && "resizing")} style={{ "--workbench-w": `${panelWidths.workbench}px`, "--chat-w": `${panelWidths.chat}px` }}>
           <PageStrip pages={state.pages} current={state.page?.id} onSelect={loadPage} onImportPath={importPath} onFiles={importFiles} />
           <Viewer
             page={state.page}
@@ -554,7 +727,12 @@ function App() {
               setState((s) => ({ ...s, queue: data.queue, crops: data.crops || s.crops }));
             }}
             onAttachPage={() => state.page && addAttachment({ type: "page", id: state.page.id, name: state.page.file_name })}
+            canUndo={undoStack.length > 0}
+            canRedo={redoStack.length > 0}
+            onUndo={() => undoLast().catch((error) => showToast(error.message))}
+            onRedo={() => redoLast().catch((error) => showToast(error.message))}
           />
+          <div className="splitter" role="separator" aria-label="Resize workbench" onPointerDown={(event) => setPanelDrag({ kind: "workbench", startX: event.clientX, ...panelWidths })} />
           <Workbench
             page={state.page}
             crops={state.crops}
@@ -584,6 +762,7 @@ function App() {
               if (state.page) addAttachment({ type: "page", id: state.page.id, name: state.page.file_name });
             }}
           />
+          <div className="splitter" role="separator" aria-label="Resize chat" onPointerDown={(event) => setPanelDrag({ kind: "chat", startX: event.clientX, ...panelWidths })} />
           <ChatPanel
             messages={state.messages}
             models={state.models}
@@ -601,9 +780,11 @@ function App() {
             busy={busy}
             hasKey={state.hasOpenRouterKey}
             model={selectedModel}
+            reasoningEffort={state.settings.reasoningEffort || "medium"}
             sourceLanguage={state.settings.sourceLanguage || "Auto"}
             targetLanguage={state.settings.targetLanguage || "English"}
             onLanguage={(patch) => setSetting(patch)}
+            onReasoningEffort={(reasoningEffort) => setSetting({ reasoningEffort })}
             onChooseModel={() => setModal("model")}
             onAttachPage={() => state.page && addAttachment({ type: "page", id: state.page.id, name: state.page.file_name })}
             onAttachSelection={() => selectedCrop && addAttachment({ type: "crop", id: selectedCrop.id, name: selectedCrop.name || selectedCrop.label })}
@@ -612,16 +793,21 @@ function App() {
             onFillPrompt={() => setChatText(defaultChatPrompt())}
             onGuide={() => setModal("decisions")}
             onNewSession={createChatSession}
+            onTemplateSession={createTemplateSession}
             onSelectSession={selectChatSession}
             onRenameSession={renameChatSession}
+            onArchiveSession={archiveChatSession}
+            onDeleteSession={deleteChatSession}
             onClearChat={clearChat}
+            onImportTranslation={(message) => applyTranslationImport(message, false)}
+            onUndoTranslationImport={(message) => applyTranslationImport(message, true)}
             onSubmit={sendChat}
           />
         </main>
       ) : <TypesettingPlaceholder />}
 
       {modal === "onboarding" && <Onboarding state={state} onClose={() => setModal("")} onRefresh={refresh} showToast={showToast} />}
-      {modal === "projects" && <ProjectsModal state={state} onClose={() => setModal("")} onRefresh={refresh} showToast={showToast} />}
+      {modal === "projects" && <ProjectsModal state={state} onClose={() => setModal("")} onRefresh={refresh} showToast={showToast} confirmAction={confirmAction} />}
       {modal === "model" && <ModelPicker models={state.models} selected={state.selectedModel} query={modelQuery} setQuery={setModelQuery} visionOnly={visionOnly} setVisionOnly={setVisionOnly} onClose={() => setModal("")} onSelect={(modelId) => { setSetting({ defaultModel: modelId }).catch((error) => showToast(error.message)); setModal(""); }} />}
       {modal === "settings" && <SettingsModal state={state} onClose={() => setModal("")} onSave={setSetting} showToast={showToast} />}
       {modal === "account" && <AccountModal state={state} onClose={() => setModal("")} onRefresh={refresh} showToast={showToast} />}
@@ -634,6 +820,7 @@ function App() {
         const data = await api("/api/decisions", { method: "POST", body: JSON.stringify({ decisions }) });
         setState((s) => ({ ...s, decisions: data.decisions }));
       }} />}
+      {dialog && <AppDialog dialog={dialog} />}
       {toast && <div className="toast">{toast}</div>}
       {busy && <div className="busy">{importStatus || "Working..."}</div>}
     </div>
@@ -643,14 +830,14 @@ function App() {
 function Chrome({ mode, setMode, project, projectProgress, model, decisions, hasKey, keyInfo, onProject, onGuide, onModel, onSettings, onExport, onAccount }) {
   const usage = keyInfo?.usage ? `$${Number(keyInfo.usage).toFixed(2)} used` : hasKey ? "connected" : "offline";
   const projectStatus = projectProgress?.pages
-    ? `Final ${projectProgress.final}/${projectProgress.pages} · Drafted ${projectProgress.drafted + projectProgress.final}/${projectProgress.pages}`
+    ? `Untranslated ${projectProgress.untranslated} · Drafted ${projectProgress.drafted + projectProgress.inProgress} · Final ${projectProgress.final} · Typeset 0`
     : "";
   return (
     <header className="chrome">
       <div className="brand"><span className="dot"><Icon name="logo" size={18} /></span><span>MangaTranslator</span></div>
       <div className="divider" />
       <button className="project-name" title={project?.path || "No project"} aria-label="Open projects" onClick={onProject}><span>Project · </span><b>{project?.name || "No project"}</b><Icon name="chevronDown" size={12} /></button>
-      {projectStatus && <span className="project-progress">{projectStatus}</span>}
+      {projectStatus && <span className="project-progress" title={`${projectProgress.pages} pages · ${projectProgress.lines} lines · Reviewed pages are counted as final in this build`}>{projectStatus}</span>}
       <button className="guide-button" onClick={onGuide} aria-label="Open Project Guide"><Icon name="book" size={13} /><b>Project Guide</b><span>{decisions?.length || 0} rules</span></button>
       <div className="tabs" role="tablist" aria-label="App mode">
         <button aria-pressed={mode === "translation"} onClick={() => setMode("translation")}><Icon name="reading" size={13} /> Translation</button>
@@ -717,9 +904,11 @@ function PageProgress({ page, compact = false }) {
   );
 }
 
-function Viewer({ page, crops, selectedCropId, setSelectedCropId, tool, setTool, onCreateCrop, onUpdateCrop, onFiles, onQueueAll, onAttachPage }) {
+function Viewer({ page, crops, selectedCropId, setSelectedCropId, tool, setTool, onCreateCrop, onUpdateCrop, onFiles, onQueueAll, onAttachPage, canUndo, canRedo, onUndo, onRedo }) {
   const viewportRef = useRef(null);
   const imageRef = useRef(null);
+  const emptyFileRef = useRef(null);
+  const emptyFolderRef = useRef(null);
   const [drawing, setDrawing] = useState(null);
   const [panning, setPanning] = useState(null);
   const [dragActive, setDragActive] = useState(false);
@@ -824,8 +1013,15 @@ function Viewer({ page, crops, selectedCropId, setSelectedCropId, tool, setTool,
         {!page ? (
           <div className="empty-state">
             <Icon name="image" size={32} />
-            <h2>Import your first page</h2>
-            <p>Drop images, folders, ZIP, or CBZ files into the project. PDF support is queued into this importer.</p>
+            <h2>Import pages</h2>
+            <p>Drop images, folders, ZIP, or CBZ files here. CBR returns a clear extractor message; PDF rasterization is planned.</p>
+            <div className="empty-actions">
+              <button className="btn primary" onClick={() => emptyFileRef.current?.click()}><Icon name="plus" /> Add files</button>
+              <button className="btn ghost" onClick={() => emptyFolderRef.current?.click()}><Icon name="folder" /> Add folder</button>
+            </div>
+            <div className="format-row"><span>PNG</span><span>JPG</span><span>WEBP</span><span>ZIP</span><span>CBZ</span><span>CBR</span><span>PDF planned</span></div>
+            <input ref={emptyFileRef} hidden type="file" multiple accept="image/*,.zip,.cbz,.cbr,.pdf" onChange={(e) => onFiles([...e.target.files])} />
+            <input ref={emptyFolderRef} hidden type="file" multiple webkitdirectory="" onChange={(e) => onFiles([...e.target.files])} />
           </div>
         ) : (
           <div
@@ -864,7 +1060,14 @@ function Viewer({ page, crops, selectedCropId, setSelectedCropId, tool, setTool,
           </div>
         )}
       </div>
-      <div className="viewer-footer"><Icon name="check" className="success" /> Saved locally · {crops.length} crops · {crops.filter((c) => c.type === "speech").length} speech <span className="spacer" /><span className="kbd">V</span> Select <span className="kbd">C</span> Crop <span className="kbd">Shift Enter</span> Send</div>
+      <div className="viewer-footer">
+        <Icon name="check" className="success" /> Saved locally · {crops.length} crops · {crops.filter((c) => c.type === "speech").length} speech
+        <div className="history-controls">
+          <button className="btn icon sm ghost" disabled={!canUndo} onClick={onUndo} title="Undo crop edit" aria-label="Undo crop edit"><Icon name="chevronLeft" /></button>
+          <button className="btn icon sm ghost" disabled={!canRedo} onClick={onRedo} title="Redo crop edit" aria-label="Redo crop edit"><Icon name="chevronRight" /></button>
+        </div>
+        <span className="spacer" /><span className="kbd">V</span> Select <span className="kbd">C</span> Crop <span className="kbd">Shift Enter</span> Send
+      </div>
     </section>
   );
 }
@@ -943,12 +1146,12 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
   const queueIndex = useMemo(() => new Map(queue.map((crop, index) => [crop.id, index])), [queue]);
   const visibleRows = scratchpad.filter((entry) => {
     if (filter === "queue") return queue.some((crop) => crop.label === entry.label);
-    if (filter === "draft") return entry.draft && !entry.final;
-    if (filter === "final") return entry.final;
+    if (filter === "draft") return entry.draft && !entry.confirmed;
+    if (filter === "final") return entry.confirmed;
     return true;
   });
-  const draftCount = scratchpad.filter((row) => row.draft && !row.final).length;
-  const finalCount = scratchpad.filter((row) => row.final).length;
+  const draftCount = scratchpad.filter((row) => row.draft && !row.confirmed).length;
+  const finalCount = scratchpad.filter((row) => row.confirmed).length;
   return (
     <aside className="workbench">
       <div className="panel-header">
@@ -956,9 +1159,16 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
         <div className="hstack mini">
           <button className="btn icon sm ghost" aria-pressed={view === "text"} onClick={() => setView("text")} title="Text list view" aria-label="Text list view"><Icon name="queue" /></button>
           <button className="btn icon sm ghost" aria-pressed={view === "card"} onClick={() => setView("card")} title="Card view" aria-label="Card view"><Icon name="grid" /></button>
-          <button className="btn icon sm ghost" onClick={onDecisions} title="Project decisions" aria-label="Project decisions"><Icon name="book" /></button>
         </div>
       </div>
+      {!page ? (
+        <div className="panel-empty">
+          <Icon name="image" size={24} />
+          <b>No page selected</b>
+          <span>Import pages or choose a thumbnail to start cropping and drafting lines.</span>
+        </div>
+      ) : (
+      <>
       <div className="filter-row">
         {[["all", "All", scratchpad.length], ["queue", "Queue", queue.length], ["draft", "Drafts", draftCount], ["final", "Final", finalCount]].map(([id, label, count]) => (
           <button key={id} className="btn sm ghost" aria-pressed={filter === id} onClick={() => setFilter(id)}>{label} <span>{count}</span></button>
@@ -984,13 +1194,13 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
             );
           })}
           {visibleRows.map((row) => <button key={row.id} className="scratch-card" onClick={() => setSelectedEntryId(row.id)}><ScratchSummary row={row} /><p>{row.notes || "No notes yet."}</p></button>)}
-          {!crops.length && !visibleRows.length && <div className="quiet">Crops and scratchpad cards will appear here.</div>}
+          {!crops.length && !visibleRows.length && <div className="panel-empty small"><Icon name="rectangle" /><b>No crops or lines yet</b><span>Create crops on the page or add a scratchpad line.</span></div>}
         </div>
       ) : (
         <div className="workbench-body">
           <div className="line-list mt-scroll">
             {visibleRows.map((row) => <button key={row.id} className={classNames("line-row", selectedEntry?.id === row.id && "active")} onClick={() => setSelectedEntryId(row.id)}><ScratchSummary row={row} /></button>)}
-            {!visibleRows.length && <div className="quiet">Model first-pass lines will appear here automatically.</div>}
+            {!visibleRows.length && <div className="panel-empty small"><Icon name="queue" /><b>No scratchpad lines</b><span>Use + Line, send a first-pass translation to scratchpad, or select crops to build a queue.</span></div>}
           </div>
           <EntryEditor entry={selectedEntry} onSave={onSaveEntry} onDelete={onDeleteEntry} onAsk={onAskLine} />
         </div>
@@ -1023,6 +1233,8 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
         onDuplicate={onDuplicateCrop}
         onDelete={onDeleteCrop}
       />
+      </>
+      )}
     </aside>
   );
 }
@@ -1075,43 +1287,85 @@ function CropInspector({ crop, queuedIndex, queueTotal, focusCropId, onFocusCons
 }
 
 function ScratchSummary({ row }) {
+  const type = normalizeLineType(row.type, row.label);
   return (
     <>
-      <span className={classNames("pill dot", row.type)}>{row.label}</span>
+      <span className={classNames("pill dot", type)}>{row.label}</span>
       <span className="truncate">{row.final || row.draft || "No translation yet"}</span>
       <small>{row.source || ""}</small>
-      {row.final && <Icon name="check" className="success" />}
+      {Boolean(row.confirmed) && <Icon name="check" className="success" />}
     </>
   );
 }
 
 function EntryEditor({ entry, onSave, onDelete, onAsk }) {
   const [draft, setDraft] = useState(entry || {});
-  useEffect(() => setDraft(entry || {}), [entry?.id]);
-  if (!entry) return <div className="entry-editor quiet">Select or create a scratchpad line.</div>;
+  const [saveStatus, setSaveStatus] = useState("saved");
+  const pendingSaves = useRef(new Map());
+  const waitForPendingSave = async (entryId) => {
+    const pending = pendingSaves.current.get(entryId);
+    if (pending) await pending.catch(() => {});
+  };
+  const saveDraft = async (patch = {}) => {
+    if (!entry) return;
+    const entryId = entry.id;
+    const next = { ...draft, ...patch, id: entryId };
+    setDraft(next);
+    setSaveStatus("saving");
+    const previous = pendingSaves.current.get(entryId) || Promise.resolve();
+    const savePromise = previous.catch(() => {}).then(() => onSave(next));
+    pendingSaves.current.set(entryId, savePromise);
+    try {
+      await savePromise;
+      setSaveStatus("saved");
+    } finally {
+      if (pendingSaves.current.get(entryId) === savePromise) pendingSaves.current.delete(entryId);
+    }
+  };
   const update = (patch) => setDraft((value) => ({ ...value, ...patch }));
+  const dirty = Boolean(entry) && ["label", "type", "source", "draft", "final", "notes", "confirmed"].some((key) => String(draft[key] ?? "") !== String(entry[key] ?? ""));
+  const confirmed = Boolean(draft.confirmed);
+  useEffect(() => {
+    setDraft(entry || {});
+    setSaveStatus("saved");
+  }, [entry?.id]);
+  useEffect(() => {
+    if (!entry) return undefined;
+    if (!dirty) {
+      setSaveStatus("saved");
+      return undefined;
+    }
+    setSaveStatus("unsaved");
+    const timer = window.setTimeout(() => {
+      saveDraft().catch(() => setSaveStatus("unsaved"));
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [draft, dirty, entry?.id]);
+  if (!entry) return <div className="entry-editor quiet">Select or create a scratchpad line.</div>;
   return (
-    <form className="entry-editor mt-scroll" onSubmit={(e) => { e.preventDefault(); onSave(draft); }}>
+    <form className="entry-editor mt-scroll" onSubmit={async (e) => { e.preventDefault(); await saveDraft({ confirmed: confirmed ? 0 : 1 }); }}>
       <div className="editor-head">
-        <input value={draft.label || ""} onChange={(e) => update({ label: e.target.value, type: labelType(e.target.value) })} />
-        <select value={draft.type || "speech"} onChange={(e) => update({ type: e.target.value })}><option value="speech">speech</option><option value="sfx">sfx</option><option value="narration">narration</option></select>
+        <input value={draft.label || ""} onChange={(e) => update({ label: e.target.value, type: labelType(e.target.value) })} onBlur={() => dirty && saveDraft()} />
+        <select value={draft.type || "speech"} onChange={(e) => saveDraft({ type: e.target.value })}><option value="speech">speech</option><option value="sfx">sfx</option><option value="narration">narration</option></select>
+        <span className={classNames("save-state", saveStatus)}>{saveStatus === "saving" ? "Saving" : dirty ? "Unsaved" : "Saved"}</span>
         <button type="button" className="btn icon sm ghost" onClick={() => onAsk(entry)} title="Ask about this line" aria-label="Ask about this line"><Icon name="chat" /></button>
-        <button type="button" className="btn icon sm ghost" onClick={() => onDelete(entry)} title="Delete line" aria-label="Delete line"><Icon name="trash" /></button>
+        <button type="button" className="btn icon sm ghost" onClick={async () => { await waitForPendingSave(entry.id); await onDelete(entry); }} title="Delete line" aria-label="Delete line"><Icon name="trash" /></button>
       </div>
-      <label>Source <textarea value={draft.source || ""} onChange={(e) => update({ source: e.target.value })} /></label>
-      <label>Draft <textarea value={draft.draft || ""} onChange={(e) => update({ draft: e.target.value })} /></label>
-      <label>Final <textarea className="final" value={draft.final || ""} onChange={(e) => update({ final: e.target.value })} /></label>
-      <label>Notes <textarea value={draft.notes || ""} onChange={(e) => update({ notes: e.target.value })} /></label>
+      <label>Source <textarea value={draft.source || ""} onChange={(e) => update({ source: e.target.value })} onBlur={() => dirty && saveDraft()} /></label>
+      <label>Draft <textarea value={draft.draft || ""} onChange={(e) => update({ draft: e.target.value })} onBlur={() => dirty && saveDraft()} /></label>
+      <label>Final <textarea className="final" value={draft.final || ""} onChange={(e) => update({ final: e.target.value, confirmed: 0 })} onBlur={() => dirty && saveDraft()} /></label>
+      <label>Notes <textarea value={draft.notes || ""} onChange={(e) => update({ notes: e.target.value })} onBlur={() => dirty && saveDraft()} /></label>
       <div className="hstack">
-        <button type="button" className="btn sm ghost" onClick={() => update({ final: draft.draft || "" })}><Icon name="copy" /> Copy draft to final</button>
+        <button type="button" className="btn sm ghost" onClick={() => saveDraft({ final: draft.draft || "", confirmed: 0 })}><Icon name="copy" /> Copy draft to final</button>
         <span className="spacer" />
-        <button className="btn primary sm"><Icon name="check" /> Save</button>
+        {dirty && <button type="button" className="btn sm ghost" onClick={() => saveDraft()}>Save edits</button>}
+        <button className={classNames("btn sm", confirmed ? "ghost" : "primary")}><Icon name={confirmed ? "close" : "check"} /> {confirmed ? "Unconfirm" : "Confirm"}</button>
       </div>
     </form>
   );
 }
 
-function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attachments, setAttachments, crops, queue, page, selectedCrop, decisions, text, setText, busy, hasKey, model, sourceLanguage, targetLanguage, onLanguage, onChooseModel, onAttachPage, onAttachSelection, hasSelection, onAttachQueue, onFillPrompt, onGuide, onNewSession, onSelectSession, onRenameSession, onClearChat, onSubmit }) {
+function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attachments, setAttachments, crops, queue, page, selectedCrop, decisions, text, setText, busy, hasKey, model, reasoningEffort, sourceLanguage, targetLanguage, onLanguage, onReasoningEffort, onChooseModel, onAttachPage, onAttachSelection, hasSelection, onAttachQueue, onFillPrompt, onGuide, onNewSession, onTemplateSession, onSelectSession, onRenameSession, onArchiveSession, onDeleteSession, onClearChat, onImportTranslation, onUndoTranslationImport, onSubmit }) {
   const pageAttached = Boolean(page && attachments.some((item) => item.type === "page" && item.id === page.id));
   const attachedCropIds = new Set(attachments.filter((item) => item.type === "crop").map((item) => item.id));
   const selectionAttached = Boolean(selectedCrop && attachedCropIds.has(selectedCrop.id));
@@ -1140,7 +1394,7 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         <div className="hstack"><Icon name="chat" /><b>Translation chat</b><span className="pill">auto-saved</span></div>
       </div>
       <div className="chat-pass-row">
-        <span>Pass</span>
+        <span>Chats</span>
         {editingSessionId === activeChatSessionId ? (
           <form className="chat-session-editor" onSubmit={commitRename}>
             <input value={sessionTitle} onChange={(e) => setSessionTitle(e.target.value)} onKeyDown={(e) => { if (e.key === "Escape") setEditingSessionId(""); }} autoFocus />
@@ -1153,7 +1407,14 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         )}
         <button className="btn icon sm ghost" onClick={() => startRename(activeSession)} disabled={!activeSession} title="Rename active pass" aria-label="Rename active pass"><Icon name="pencil" /></button>
         <button className="btn icon sm ghost" onClick={onNewSession} disabled={!page} title="New pass" aria-label="New chat pass"><Icon name="plus" /></button>
+        <button className="btn icon sm ghost" onClick={() => onArchiveSession(activeSession)} disabled={!activeSession} title="Archive pass" aria-label="Archive active pass"><Icon name="archive" /></button>
+        <button className="btn icon sm ghost" onClick={() => onDeleteSession(activeSession)} disabled={!activeSession} title="Delete pass" aria-label="Delete active pass"><Icon name="trash" /></button>
         <button className="btn sm ghost subtle" onClick={() => onClearChat("session")} disabled={!messages.length}>Clear</button>
+      </div>
+      <div className="template-row">
+        {PASS_TEMPLATES.map((template) => (
+          <button key={template.id} className="btn sm ghost" disabled={!page || (template.id === "crop-queue" && !queue.length) || (template.id === "line-refine" && !hasSelection)} onClick={() => onTemplateSession(template)}>{template.label}</button>
+        ))}
       </div>
       <div className="language-row">
         <Icon name="globe" />
@@ -1161,6 +1422,12 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         <Icon name="chevronRight" />
         <select value={targetLanguage} onChange={(e) => onLanguage({ targetLanguage: e.target.value })}>{LANGUAGES.filter((l) => l !== "Auto").map((lang) => <option key={lang}>{lang}</option>)}</select>
         <button className="btn sm ghost model-select" onClick={onChooseModel}><Icon name="sparkle" /> {modelLabel(model)}</button>
+        <label className="reasoning-select" title="OpenRouter reasoning effort">
+          <span>Think</span>
+          <select value={reasoningEffort} onChange={(e) => onReasoningEffort(e.target.value)}>
+            {REASONING_EFFORTS.map((effort) => <option key={effort} value={effort}>{effort}</option>)}
+          </select>
+        </label>
       </div>
       <div className="context-row">
         <span>Attached</span>
@@ -1171,8 +1438,15 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         )) : <small>No page or crop attached</small>}
         <button className="pill guide-chip" onClick={onGuide} title={guideSummary(decisions)}><Icon name="book" size={11} /> {guideShortSummary(decisions)}</button>
       </div>
+      {queue.length > 0 && (
+        <div className="queue-send-strip">
+          <span>Queue</span>
+          <div>{queue.map((crop, index) => <button key={crop.id} className={classNames("pill", attachments.some((item) => item.id === crop.id) && "active")} onClick={() => setAttachments(attachments.filter((item) => item.id !== crop.id))}>{index + 1}. {crop.label || crop.name}</button>)}</div>
+          <button className="btn sm ghost" onClick={onAttachQueue}><Icon name="queue" /> Attach queue</button>
+        </div>
+      )}
       <div className="message-list mt-scroll">
-        {messages.map((message, index) => <Message key={message.id || index} message={message} models={models} />)}
+        {messages.map((message, index) => <Message key={message.id || index} message={message} models={models} onImportTranslation={onImportTranslation} onUndoTranslationImport={onUndoTranslationImport} />)}
         {!messages.length && (
           <div className="chat-empty">
             <p>Start a focused pass for this page.</p>
@@ -1208,27 +1482,43 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
   );
 }
 
-function Message({ message, models }) {
+function Message({ message, models, onImportTranslation, onUndoTranslationImport }) {
   const attachments = safeJson(message.attachments_json, []);
+  const structuredEntries = safeJson(message.translation_entries_json, []);
   const isUser = message.role === "user";
   const isError = String(message.role).includes("error");
   const isAssistant = String(message.role).startsWith("assistant");
   const roleLabel = isUser ? "user" : "assistant";
-  const modelName = isAssistant && message.model ? modelLabelForId(message.model, models) : "";
+  const modelObject = isAssistant && message.model ? models.find((item) => item.id === message.model) || { id: message.model } : null;
+  const modelName = modelObject ? modelLabel(modelObject) : "";
+  const provider = modelObject?.id?.includes("/") ? modelObject.id.split("/")[0] : "";
+  const modalities = [...(modelObject?.architecture?.input_modalities || []), modelObject?.architecture?.modality || ""].join(" ").toLowerCase();
+  const isVision = /image|vision|multimodal/.test(modalities) || String(modelObject?.id || "").includes("gemini");
   const bodyText = String(message.content || "").trim();
   const hasBody = Boolean(bodyText && !(isUser && bodyText === "..." && attachments.length));
+  const importedCount = structuredEntries.filter((entry) => entry.scratchpad_entry_id).length;
   return (
     <article className={classNames("message", isUser ? "user" : "assistant", isError && "error")}>
-      <div className="message-meta"><span>{roleLabel}</span>{modelName && <b title={message.model}>{modelName}</b>}{message.created_at && <time>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}{attachments.length > 0 && <b>{attachments.length} attachment{attachments.length === 1 ? "" : "s"}</b>}</div>
+      <div className="message-meta"><span>{roleLabel}</span>{provider && <b className="provider-badge">{provider}</b>}{modelName && <b title={`${message.model}${modelObject?.pricing ? ` · ${formatPricing(modelObject.pricing)}` : ""}`}>{modelName}</b>}{isVision && <b className="vision-badge">vision</b>}{message.created_at && <time>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}{attachments.length > 0 && <b>{attachments.length} attachment{attachments.length === 1 ? "" : "s"}</b>}</div>
       {attachments.length > 0 && <div className="message-attachments">{attachments.map((a) => <span key={`${a.type}:${a.id}`}>{a.type}: {a.name || a.id}</span>)}</div>}
+      {isAssistant && structuredEntries.length > 0 && (
+        <div className="translation-actions">
+          <span>{structuredEntries.length} structured line{structuredEntries.length === 1 ? "" : "s"}{importedCount ? ` · ${importedCount} in scratchpad` : ""}</span>
+          {importedCount ? (
+            <button className="btn sm ghost" onClick={() => onUndoTranslationImport?.(message)}><Icon name="close" /> Undo scratchpad</button>
+          ) : (
+            <button className="btn sm primary" onClick={() => onImportTranslation?.(message)}><Icon name="check" /> Send to scratchpad</button>
+          )}
+        </div>
+      )}
       {hasBody ? <MessageBody content={message.content} isAssistant={isAssistant} /> : (isAssistant && <div className="message-bubble pending">...</div>)}
     </article>
   );
 }
 
 function MessageBody({ content, isAssistant }) {
-  const blocks = isAssistant ? parseAssistantBlocks(content) : [];
-  if (blocks.length >= 2) {
+  const { blocks, remainder } = isAssistant ? parseAssistantContent(content) : { blocks: [], remainder: "" };
+  if (blocks.length > 0) {
     return (
       <div className="assistant-blocks">
         {blocks.map((block, index) => (
@@ -1239,57 +1529,21 @@ function MessageBody({ content, isAssistant }) {
             {block.notes && <p><strong>Notes</strong>{block.notes}</p>}
           </section>
         ))}
+        {remainder && <MarkdownBubble content={remainder} />}
       </div>
     );
   }
-  return <div className="message-bubble">{renderLightMarkdown(content)}</div>;
+  return <MarkdownBubble content={content} />;
 }
 
-function parseAssistantBlocks(content = "") {
-  const lines = String(content).split(/\r?\n/);
-  const blocks = [];
-  let current = null;
-  const commit = () => {
-    if (current && (current.source || current.draft || current.notes || current.type)) blocks.push(current);
-  };
-  for (const rawLine of lines) {
-    const line = rawLine.trim();
-    const match = line.match(/^(?:[-*]\s*)?(?:\*\*)?Label(?:\*\*)?\s*:\s*(SFX\d+|S\d+|N\d+)/i);
-    if (match) {
-      commit();
-      current = { label: match[1].toUpperCase(), type: "", source: "", draft: "", notes: "" };
-      continue;
-    }
-    if (!current) continue;
-    const field = line.match(/^(?:[-*]\s*)?(?:\*\*)?(Type|Source|Draft|Notes?)(?:\*\*)?\s*:\s*(.*)$/i);
-    if (!field) {
-      if (line && current.notes) current.notes += ` ${stripMarkdown(line)}`;
-      continue;
-    }
-    const key = field[1].toLowerCase().replace("note", "notes");
-    current[key] = stripMarkdown(field[2]);
-  }
-  commit();
-  return blocks;
-}
-
-function renderLightMarkdown(content = "") {
-  return String(content).split(/\r?\n/).map((line, index) => {
-    const clean = stripMarkdown(line);
-    if (!clean) return <br key={index} />;
-    const heading = line.match(/^#{1,4}\s+(.+)$/);
-    if (heading) return <strong key={index} className="md-heading">{stripMarkdown(heading[1])}</strong>;
-    return <React.Fragment key={index}>{clean}{index < String(content).split(/\r?\n/).length - 1 ? "\n" : ""}</React.Fragment>;
-  });
-}
-
-function stripMarkdown(value = "") {
-  return String(value)
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/__([^_]+)__/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/^[-*]\s+/, "")
-    .trim();
+function MarkdownBubble({ content }) {
+  return (
+    <div className="message-bubble markdown-body">
+      <Suspense fallback={<span>{String(content || "")}</span>}>
+        <Streamdown>{String(content || "")}</Streamdown>
+      </Suspense>
+    </div>
+  );
 }
 
 function Onboarding({ state, onClose, onRefresh, showToast }) {
@@ -1320,7 +1574,7 @@ function Onboarding({ state, onClose, onRefresh, showToast }) {
   );
 }
 
-function ProjectsModal({ state, onClose, onRefresh, showToast }) {
+function ProjectsModal({ state, onClose, onRefresh, showToast, confirmAction }) {
   const [workspaceRoot, setWorkspaceRoot] = useState(state.workspaceRoot || state.defaultWorkspaceRoot);
   const [projectName, setProjectName] = useState("New Manga Project");
   const [importMode, setImportMode] = useState("copy");
@@ -1342,6 +1596,16 @@ function ProjectsModal({ state, onClose, onRefresh, showToast }) {
       showToast(error.message);
     }
   };
+  const deleteProject = async (project) => {
+    if (!project || !(await confirmAction({ title: "Delete Project", message: `Delete project ${project.name}? This removes its local workspace folder.`, confirmLabel: "Delete", danger: true }))) return;
+    try {
+      await api("/api/projects/delete", { method: "POST", body: JSON.stringify({ slug: project.slug }) });
+      await onRefresh();
+      showToast("Project deleted.");
+    } catch (error) {
+      showToast(error.message);
+    }
+  };
   return (
     <Modal wide title="Projects" onClose={onClose}>
       <div className="projects-modal">
@@ -1349,10 +1613,13 @@ function ProjectsModal({ state, onClose, onRefresh, showToast }) {
           <h3>Open project</h3>
           <div className="project-list">
             {state.projects.map((project) => (
-              <button key={project.slug} className={state.activeProject?.slug === project.slug ? "active" : ""} onClick={() => openProject(project.slug)}>
-                <b>{project.name}</b>
-                <span>{project.path}</span>
-              </button>
+              <div key={project.slug} className={classNames("project-row", state.activeProject?.slug === project.slug && "active")}>
+                <button onClick={() => openProject(project.slug)}>
+                  <b>{project.name}</b>
+                  <span>{project.path}</span>
+                </button>
+                <button className="btn icon sm ghost" onClick={() => deleteProject(project)} title="Delete project" aria-label={`Delete project ${project.name}`}><Icon name="trash" /></button>
+              </div>
             ))}
             {!state.projects.length && <p className="muted">No projects yet.</p>}
           </div>
@@ -1378,9 +1645,23 @@ function ModelPicker({ models, selected, query, setQuery, visionOnly, setVisionO
   }).slice(0, 120);
   return (
     <Modal wide title="Choose model" onClose={onClose}>
-      <div className="model-tools"><input placeholder="Search models, vendors, slugs..." value={query} onChange={(e) => setQuery(e.target.value)} /><button className="btn" aria-pressed={visionOnly} onClick={() => setVisionOnly(!visionOnly)}><Icon name="image" /> Vision only</button></div>
+      <div className="model-tools"><input placeholder="Search models, vendors, slugs..." value={query} onChange={(e) => setQuery(e.target.value)} /><span>{filtered.length} available</span><button className="btn" aria-pressed={visionOnly} onClick={() => setVisionOnly(!visionOnly)}><Icon name="image" /> Vision only</button></div>
       <div className="model-list mt-scroll">
-        {filtered.map((model) => <button key={model.id} className={selected === model.id ? "active" : ""} onClick={() => onSelect(model.id)}><b>{modelLabel(model)}</b><code>{model.id}</code><span>{compactNumber(model.context_length)} ctx · {formatPricing(model.pricing)}</span>{selected === model.id && <Icon name="check" />}</button>)}
+        {filtered.map((model) => {
+          const provider = model.id?.split("/")?.[0] || "model";
+          const modalities = [...(model.architecture?.input_modalities || []), model.architecture?.modality || "", model.description || ""].join(" ").toLowerCase();
+          const vision = /image|vision|multimodal/.test(modalities) || model.id.includes("gemini");
+          return (
+            <button key={model.id} className={selected === model.id ? "active" : ""} onClick={() => onSelect(model.id)}>
+              <span className="provider-avatar">{provider.slice(0, 2).toUpperCase()}</span>
+              <b>{modelLabel(model)}</b>
+              <span className="model-badges">{vision && <i>vision</i>}{model.id === DEFAULT_MODEL && <i>default</i>}{selected === model.id && <i>selected</i>}</span>
+              <code>{model.id}</code>
+              <span className="model-pricing">{compactNumber(model.context_length)} ctx · {formatPricing(model.pricing)}</span>
+              {selected === model.id && <Icon name="check" />}
+            </button>
+          );
+        })}
       </div>
     </Modal>
   );
@@ -1408,6 +1689,7 @@ function SettingsModal({ state, onClose, onSave, showToast }) {
 
 function AccountModal({ state, onClose, onRefresh, showToast }) {
   const [key, setKey] = useState("");
+  const [busy, setBusy] = useState(false);
   const migrateLegacyKey = async () => {
     try {
       await api("/api/auth/openrouter/migrate-legacy", { method: "POST", body: JSON.stringify({}) });
@@ -1418,6 +1700,20 @@ function AccountModal({ state, onClose, onRefresh, showToast }) {
       showToast(error.message);
     }
   };
+  const saveKey = async () => {
+    setBusy(true);
+    try {
+      await api("/api/auth/openrouter/key", { method: "POST", body: JSON.stringify({ key }) });
+      await onRefresh();
+      showToast("OpenRouter key validated and saved locally.");
+      onClose();
+    } catch (error) {
+      showToast(error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <Modal title="OpenRouter account" onClose={onClose}>
       <p>{state.hasOpenRouterKey ? "OpenRouter is connected locally." : "Connect OpenRouter, paste an API key, or reuse the legacy local key if available."}</p>
@@ -1425,7 +1721,7 @@ function AccountModal({ state, onClose, onRefresh, showToast }) {
       {state.authError && <p className="notice danger">Last OpenRouter callback error: {state.authError}</p>}
       <button className="btn primary" onClick={async () => { const data = await api("/api/auth/openrouter/start"); window.open(data.url, "_blank", "width=960,height=800"); showToast("OpenRouter login opened."); setTimeout(onRefresh, 5000); }}><Icon name="sparkle" /> Connect OpenRouter</button>
       {state.legacyOpenRouterKeyAvailable && !state.hasOpenRouterKey && <button className="btn ghost" onClick={migrateLegacyKey}><Icon name="key" /> Use legacy local key</button>}
-      <div className="key-row"><input type="password" placeholder="sk-or-v1-..." value={key} onChange={(e) => setKey(e.target.value)} /><button className="btn" onClick={async () => { await api("/api/auth/openrouter/key", { method: "POST", body: JSON.stringify({ key }) }); await onRefresh(); onClose(); }}>Save key</button></div>
+      <div className="key-row"><input type="password" placeholder="sk-or-v1-..." value={key} onChange={(e) => setKey(e.target.value)} /><button className="btn" disabled={busy || !key.trim()} onClick={saveKey}>{busy ? "Checking..." : "Save key"}</button></div>
       {state.keyInfo && <pre>{JSON.stringify(state.keyInfo, null, 2)}</pre>}
     </Modal>
   );
@@ -1492,7 +1788,33 @@ function DecisionsModal({ project, decisions, onClose, onSave }) {
 }
 
 function TypesettingPlaceholder() {
-  return <main className="typesetting"><Icon name="type" size={32} /><h1>Typesetting</h1><p>Place final translations back onto the page with text-clearing, balloon fills, font rules, flattened PNG export, and layered output. Queued after translation mode feels excellent.</p><div><b>Shipping order</b><span>Image cleaning</span><span>Text placement linked to finals</span><span>Font management</span><span>Layered export</span></div></main>;
+  const steps = [["Queued", "Image cleaning"], ["Next", "Text placement linked to finals"], ["Next", "Font management"], ["Later", "Layered export"]];
+  return <main className="typesetting"><div className="typesetting-mark"><Icon name="type" size={32} /></div><h1>Typesetting</h1><p>Place final translations back onto the page with text clearing, balloon fills, font rules, flattened PNG export, and layered output.</p><div><b>Shipping order</b>{steps.map(([status, label]) => <span key={label}><i>{status}</i>{label}</span>)}</div></main>;
+}
+
+function AppDialog({ dialog }) {
+  const [value, setValue] = useState(dialog.value || "");
+  const submit = (event) => {
+    event.preventDefault();
+    if (dialog.type === "prompt") dialog.onConfirm(value);
+    else dialog.onConfirm();
+  };
+  return (
+    <div className="overlay" onMouseDown={dialog.onCancel}>
+      <form className="modal dialog-modal" onSubmit={submit} onMouseDown={(event) => event.stopPropagation()}>
+        <header><h2>{dialog.title}</h2><button type="button" className="btn icon sm ghost" onClick={dialog.onCancel} title="Cancel" aria-label="Cancel"><Icon name="close" /></button></header>
+        <div className="modal-pane">
+          <p>{dialog.message}</p>
+          {dialog.type === "prompt" && <input autoFocus value={value} placeholder={dialog.placeholder || ""} onChange={(event) => setValue(event.target.value)} />}
+        </div>
+        <div className="hstack modal-actions">
+          <span className="spacer" />
+          <button type="button" className="btn ghost" onClick={dialog.onCancel}>Cancel</button>
+          <button className={classNames("btn", dialog.danger ? "danger" : "primary")}>{dialog.confirmLabel || "Confirm"}</button>
+        </div>
+      </form>
+    </div>
+  );
 }
 
 function Modal({ title, children, onClose, wide }) {
@@ -1527,6 +1849,14 @@ function labelType(label = "") {
   if (up.startsWith("SFX")) return "sfx";
   if (up.startsWith("N")) return "narration";
   return "speech";
+}
+
+function normalizeLineType(type = "", label = "") {
+  const value = String(type || "").toLowerCase();
+  if (["speech", "dialogue", "dialog", "spoken"].includes(value)) return "speech";
+  if (["sfx", "sound effect", "sound_effect", "sound-effect", "onomatopoeia"].includes(value)) return "sfx";
+  if (["narration", "narrative", "caption", "narrator"].includes(value)) return "narration";
+  return labelType(label);
 }
 
 function nextCropLabel(crops) {
