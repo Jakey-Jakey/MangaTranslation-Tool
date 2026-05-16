@@ -17,37 +17,37 @@
 
 ### Set 3: App Structure
 - [ ] Split `src/main.jsx` into stable workflow modules: viewer, workbench, chat, modals, API client, and parsers.
-- [ ] Move chat/translation parsing helpers into dedicated parser modules with focused tests.
-- [ ] Move frontend API helpers into an API/client module with shared response/error handling.
-- [ ] Evaluate TanStack Query for project/page/status/chat cache, mutations, optimistic updates, and invalidation.
-- [ ] Evaluate React Hook Form for settings, account, Project Guide, export, and onboarding forms after UI modules are split.
+- [x] Move chat/translation parsing helpers into dedicated parser modules with focused tests.
+- [x] Move frontend API helpers into an API/client module with shared response/error handling.
+- [x] Evaluate TanStack Query for project/page/status/chat cache, mutations, optimistic updates, and invalidation.
+- [x] Evaluate React Hook Form for settings, account, Project Guide, export, and onboarding forms after UI modules are split.
 
 ### Set 4: Workbench Workflow
 - [x] Add archive/delete controls for chat passes with confirmation.
 - [x] Add pass templates: full page pass, crop queue pass, line refinement pass, terminology pass.
 - [ ] Render structured first-pass output as editable line cards linked to scratchpad rows.
-- [ ] Add autosave debounce indicators for scratchpad edits.
+- [x] Add autosave debounce indicators for scratchpad edits.
 - [ ] Add persistent undo/redo for scratchpad edits and chat/context clearing.
 
 ### Set 5: Layout And Daily Usability
 - [x] Make the Workbench and chat panels horizontally adjustable with draggable splitters.
 - [x] Add responsive behavior so Workbench and chat remain reachable below desktop widths.
 - [x] Replace remaining native `prompt` / `confirm` dialogs with in-app modal flows.
-- [ ] Improve empty/import states for no project, empty project, no page, no crops, no scratchpad rows, and no chat.
-- [ ] Make sent attachments visually distinct from ready-to-send attachments.
+- [x] Improve empty/import states for no project, empty project, no page, no crops, no scratchpad rows, and no chat.
+- [x] Make sent attachments visually distinct from ready-to-send attachments.
 
 ### Set 6: Import Pipeline
 - [ ] Add import progress for large folders, ZIP, and CBZ jobs.
 - [x] Add duplicate import detection or clear duplicate handling.
-- [ ] Add browser-upload and local-path sample import coverage.
+- [x] Add browser-upload and local-path sample import coverage.
 - [ ] Implement PDF rasterization into page images.
 - [ ] Implement CBR extraction if a portable extractor is practical.
 
 ### Set 7: Testing And QA
-- [ ] Expand smoke tests beyond "server responds" into project/page/chat/export behavior checks.
-- [ ] Add Playwright flows for import, crop creation/editing, chat, scratchpad, and export.
+- [x] Expand smoke tests beyond "server responds" into project/page/chat/export behavior checks.
+- [x] Add Playwright flows for import, crop creation/editing, chat, scratchpad, and export.
 - [ ] Add visual regression screenshots for the PDF-derived screens.
-- [ ] Add fixture projects/images for deterministic tests.
+- [x] Add fixture projects/images for deterministic tests.
 
 ### Set 8: Export And Interop
 - [x] Add CSV export.
@@ -57,10 +57,10 @@
 
 ### Set 9: Visual Fidelity
 - [ ] Tune prototype/PDF visual details after core behavior settles.
-- [ ] Improve model picker rows with provider avatars, badges, pricing, and selected-state treatment.
+- [x] Improve model picker rows with provider avatars, badges, pricing, and selected-state treatment.
 - [ ] Match settings/export modal layouts to the prototype.
 - [ ] Tune typography and color consistency.
-- [ ] Polish the typesetting placeholder.
+- [x] Polish the typesetting placeholder.
 
 ## 1. Planning Artifacts
 - [x] Create `planning/`.
@@ -186,9 +186,9 @@
 - [x] API-compatible cache copies only.
 - [x] Missing files handled with readable errors.
 - [ ] Full Windows/Linux manual launch verification.
-- [ ] Expand smoke tests beyond "server responds" into project/page/chat/export behavior checks.
-- [ ] Add Playwright flows for import, crop creation/editing, chat, scratchpad, and export.
-- [ ] Add fixture projects/images for deterministic tests.
+- [x] Expand smoke tests beyond "server responds" into project/page/chat/export behavior checks.
+- [x] Add Playwright flows for import, crop creation/editing, chat, scratchpad, and export.
+- [x] Add fixture projects/images for deterministic tests.
 
 ## 16. Current Functional Bug Bash
 - [x] OpenRouter connect error: document the observed `409 Failed to create or update app while creating auth code` path and make the in-app recovery path obvious.
@@ -234,7 +234,7 @@
 - [ ] Scratchpad list: rows should include queue toggle/order cells, label pill, draft/final text, source preview, and status icons.
 - [ ] Scratchpad editor: replace plain textareas with prototype field blocks for Source, Draft from model, Final, and Notes.
 - [ ] Scratchpad editor: support quick actions shown in the prototype, including ask/regenerate/copy/promote/delete affordances.
-- [ ] Crop queue: show a dedicated Send Queue strip in chat with ordered pills and clear/remove controls.
+- [x] Crop queue: show a dedicated Send Queue strip in chat with ordered pills and clear/remove controls.
 - [ ] Chat header: match the prototype’s keyboard/more buttons and auto-saved pill.
 - [x] Chat language strip: use prototype dropdown styling with source/target language controls and model selector.
 - [x] Chat messages: render user messages as rounded accent bubbles with attachment chips and timestamps.
@@ -243,7 +243,7 @@
 - [x] Chat message model badges should use the friendly model name everywhere, with the slug reserved for tooltip/details.
 - [x] Parse markdown/light structured assistant output into readable blocks before the fuller first-pass card UI lands.
 - [x] Keep the message list pinned to the active pending/streaming response and clear stale pending bubbles after reload.
-- [ ] Make sent attachments vs ready-to-send attachments visually distinct.
+- [x] Make sent attachments vs ready-to-send attachments visually distinct.
 - [x] Compress Project Guide chip to a short label in the chat panel.
 - [ ] Compress language/model controls into a single efficient row.
 - [ ] Assistant messages: render model identity, vision badge, token/cost metadata, first-pass chip block, and line analysis cards instead of raw preformatted text only.
@@ -254,22 +254,22 @@
 - [x] Add archive/delete chat pass controls with confirmation.
 - [x] Add pass templates: Full page pass, crop queue pass, line refinement pass, terminology pass.
 - [x] First-pass parser UI: expose "Send to scratchpad" / auto-populate behavior clearly, without making users touch Markdown tables.
-- [ ] Model picker: match prototype rows with provider avatars, vision/favorite/default badges, available count, pricing/context alignment, and full orange selected row.
+- [x] Model picker: match prototype rows with provider avatars, vision/favorite/default badges, available count, pricing/context alignment, and full orange selected row.
 - [ ] Settings modal: match prototype side-nav with icons and pages for System prompt, Languages, Workspace, Image quality, Account, and Shortcuts.
 - [ ] Settings prompt page: include reset/default and preset affordances shown in the PDF.
 - [ ] Export modal: match the PDF’s compact modal layout, scope cards, format buttons, include checkboxes, and export location display.
 - [x] Project decisions modal: group decisions by category with section headers and row-level edit/add controls instead of one generic grid.
 - [x] Rename visible Project Decisions language to Project Guide.
-- [ ] Typesetting placeholder: match the PDF’s centered icon, copy, and shipping-order list with status pills.
-- [ ] Empty/import states: match the prototype’s import/open workspace overlays and make supported formats obvious: images, folders, ZIP, CBZ, CBR message, PDF planned.
+- [x] Typesetting placeholder: match the PDF’s centered icon, copy, and shipping-order list with status pills.
+- [x] Empty/import states: match the prototype’s import/open workspace overlays and make supported formats obvious: images, folders, ZIP, CBZ, CBR message, PDF planned.
 - [ ] Modal overlays: match prototype width, dimming, border, close placement, and inner spacing.
 - [ ] Typography: tune weights/sizes to match Inter Tight / mono / JP hierarchy from the PDF.
 - [ ] Color tokens: keep the orange accent as the only selection/action color and remove inconsistent blue native UI artifacts.
 
 ## 18. Sample Manga Test Pass
 - [x] Locate the 5-6 sample manga pages the user provided in the workspace or downloads.
-- [ ] Import the sample pages through browser upload.
-- [ ] Import the sample pages through local path import.
+- [x] Import the sample pages through browser upload.
+- [x] Import the sample pages through local path import.
 - [x] Verify natural ordering of the sample pages in the page strip.
 - [x] Switch between multiple projects and confirm the viewer image, thumbnails, workbench, and chat all update.
 - [x] Create crops on several sample pages at different zoom levels.
@@ -316,13 +316,13 @@
 
 ## 20. Near-Term Frontend Gaps
 - [ ] Split the large `src/main.jsx` into stable components after behavior settles.
-- [ ] Move chat/translation parsing helpers into dedicated parser modules with focused tests.
-- [ ] Move frontend API helpers into an API/client module with shared response/error handling.
-- [ ] Evaluate TanStack Query for project/page/status/chat cache, mutations, optimistic updates, and invalidation.
-- [ ] Evaluate React Hook Form for settings, account, Project Guide, export, and onboarding forms after UI modules are split.
+- [x] Move chat/translation parsing helpers into dedicated parser modules with focused tests.
+- [x] Move frontend API helpers into an API/client module with shared response/error handling.
+- [x] Evaluate TanStack Query for project/page/status/chat cache, mutations, optimistic updates, and invalidation.
+- [x] Evaluate React Hook Form for settings, account, Project Guide, export, and onboarding forms after UI modules are split.
 - [x] Add keyboard shortcuts: V select, C crop, H pan, Shift+Enter send, Q queue.
 - [x] Add drag/drop import overlay on the viewer.
-- [ ] Add folder picker affordance that is clearer than hidden input buttons.
+- [x] Add folder picker affordance that is clearer than hidden input buttons.
 - [x] Replace remaining native `prompt` / `confirm` dialogs with in-app modal flows.
 - [x] Add "attach current page" visible state so users know the context is queued for sending.
 - [x] Add "attach selected crop" visible state and disabled state when no crop is selected.
@@ -335,14 +335,14 @@
 - [x] Focus the crop label editor after creating a crop so naming is quick and local to the app.
 - [x] Allow selected crop boxes to be moved directly on the viewer canvas.
 - [x] Allow selected crop boxes to be resized with handles on the viewer canvas.
-- [ ] Make crop mode behave like region-edit mode: drag empty canvas to create, drag existing crop to move, drag handles to resize.
+- [x] Make crop mode behave like region-edit mode: drag empty canvas to create, drag existing crop to move, drag handles to resize.
 - [x] Add hover affordances for existing crop boxes in crop mode so users know they can move/resize them.
 - [x] Add Escape-to-cancel active crop drawing or crop edit before mouse up.
 - [ ] Add Shift/Option modifiers for constrained resize and center/outward resize.
 - [ ] Add crop snap guides / soft alignment against nearby boxes and page text-box edges.
-- [ ] Add a crop history stack UI with Undo/Redo buttons, not only Command-Z.
-- [ ] Add redo support for crop create/move/resize/delete.
-- [ ] Debounce or batch crop move writes during canvas dragging so large projects stay responsive.
+- [x] Add a crop history stack UI with Undo/Redo buttons, not only Command-Z.
+- [x] Add redo support for crop create/move/resize/delete.
+- [x] Debounce or batch crop move writes during canvas dragging so large projects stay responsive.
 - [x] Add keyboard nudging for selected crop boxes with arrow keys.
 - [x] Add crop deletion from viewer, crop dock, and card view.
 - [x] Make card view show crop cards with queue/delete/edit actions instead of only scratchpad cards.
@@ -353,14 +353,14 @@
 - [x] Add "new chat" control that starts a clean model context while preserving old transcripts.
 - [x] Show active chat session/pass name and context scope in the chat header.
 - [x] Display model name, timestamp, and attachment count on every chat message.
-- [ ] Display model/provider metadata on streamed assistant responses.
+- [x] Display model/provider metadata on streamed assistant responses.
 - [ ] Render structured first-pass model output as editable line cards linked to scratchpad rows.
 - [x] Add page status display based on translation progress, e.g. Drafted 4/8 and Final 3/8.
 - [x] Show side/page-strip thumbnail progress bars only on mouse hover or keyboard focus.
-- [ ] Add project overview status counts for untranslated, drafted, reviewed, final, and typeset pages.
-- [ ] Add autosave debounce indicators for scratchpad edits.
-- [ ] Add save-on-blur for scratchpad fields.
-- [ ] Add polished empty states for no project, empty project, no page, no crops, no scratchpad rows, no chat.
+- [x] Add project overview status counts for untranslated, drafted, reviewed, final, and typeset pages.
+- [x] Add autosave debounce indicators for scratchpad edits.
+- [x] Add save-on-blur for scratchpad fields.
+- [x] Add polished empty states for no project, empty project, no page, no crops, no scratchpad rows, no chat.
 - [x] Replace empty chat sentence with focused starter actions.
 - [x] Add responsive behavior that keeps the workbench/chat reachable below desktop widths.
 - [ ] Add visual regression screenshots for the PDF-derived screens.

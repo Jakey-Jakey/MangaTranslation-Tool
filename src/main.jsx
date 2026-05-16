@@ -1,5 +1,7 @@
 import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { api, fileUrl } from "./api/client.js";
+import { parseAssistantContent } from "./parsers/assistantOutput.js";
 import "./styles.css";
 
 const Streamdown = React.lazy(() => import("streamdown").then((module) => ({ default: module.Streamdown })));
@@ -60,23 +62,6 @@ function Icon({ name, size = 14, className = "" }) {
       <path d={iconPaths[name] || iconPaths.info} />
     </svg>
   );
-}
-
-async function api(path, options = {}) {
-  const response = await fetch(path, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
-  });
-  const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(data.error || response.statusText);
-  return data;
-}
-
-function fileUrl(relativePath, cacheKey = "") {
-  const params = new URLSearchParams({ path: relativePath || "" });
-  if (cacheKey) params.set("v", cacheKey);
-  return `/api/file?${params.toString()}`;
 }
 
 function classNames(...items) {
@@ -189,6 +174,7 @@ function App() {
   const [visionOnly, setVisionOnly] = useState(true);
   const [importStatus, setImportStatus] = useState("");
   const [undoStack, setUndoStack] = useState([]);
+  const [redoStack, setRedoStack] = useState([]);
   const [labelFocusCropId, setLabelFocusCropId] = useState("");
   const [panelWidths, setPanelWidths] = useState({ workbench: 340, chat: 360 });
   const [panelDrag, setPanelDrag] = useState(null);
@@ -346,10 +332,12 @@ function App() {
     setImportStatus("Reading files...");
     try {
       const payload = [];
-      for (const file of files) {
+      for (let index = 0; index < files.length; index += 1) {
+        const file = files[index];
+        setImportStatus(`Reading ${index + 1}/${files.length}: ${file.webkitRelativePath || file.name}`);
         payload.push({ name: file.webkitRelativePath || file.name, dataUrl: await readFileDataUrl(file) });
       }
-      setImportStatus("Importing into project...");
+      setImportStatus(`Importing ${files.length} item${files.length === 1 ? "" : "s"} into project...`);
       const data = await api("/api/import/files", { method: "POST", body: JSON.stringify({ files: payload }) });
       setState((s) => ({ ...s, pages: data.pages }));
       const nextPage = data.pages.find((page) => page.id === state.page?.id) || data.pages[0];
@@ -372,6 +360,7 @@ function App() {
     });
     if (!sourcePath) return;
     setBusy(true);
+    setImportStatus("Importing path into project...");
     try {
       const data = await api("/api/import/path", { method: "POST", body: JSON.stringify({ path: sourcePath }) });
       setState((s) => ({ ...s, pages: data.pages }));
@@ -382,7 +371,34 @@ function App() {
       showToast(error.message);
     } finally {
       setBusy(false);
+      setImportStatus("");
     }
+  };
+
+  const pushUndo = (action) => {
+    setUndoStack((items) => [...items, action].slice(-40));
+    setRedoStack([]);
+  };
+
+  const restoreCrop = async (crop) => {
+    if (!state.page || !crop) return null;
+    const label = crop.label || crop.name || nextCropLabel(state.crops);
+    const data = await api("/api/crops", {
+      method: "POST",
+      body: JSON.stringify({
+        pageId: state.page.id,
+        label,
+        name: crop.name || label,
+        type: crop.type || labelType(label),
+        x: crop.x,
+        y: crop.y,
+        width: crop.width,
+        height: crop.height,
+      }),
+    });
+    setState((s) => ({ ...s, queue: data.queue, crops: data.crops || s.crops }));
+    if (data.crop?.id) setSelectedCropId(data.crop.id);
+    return data.crop || null;
   };
 
   const createCrop = async (rect) => {
@@ -394,7 +410,7 @@ function App() {
       setState((s) => ({ ...s, crops: data.crops, queue: data.queue }));
       setSelectedCropId(data.crop?.id || "");
       setLabelFocusCropId(data.crop?.id || "");
-      if (data.crop) setUndoStack((items) => [...items, { type: "createCrop", crop: data.crop }].slice(-40));
+      if (data.crop) pushUndo({ type: "createCrop", crop: data.crop });
       showToast("Crop created. Rename it in the crop inspector.");
     } catch (error) {
       showToast(error.message);
@@ -466,15 +482,16 @@ function App() {
     setState((s) => ({ ...s, queue: data.queue, crops: data.crops || s.crops }));
     setSelectedCropId(data.crop?.id || "");
     setLabelFocusCropId(data.crop?.id || "");
-    if (data.crop) setUndoStack((items) => [...items, { type: "createCrop", crop: data.crop }].slice(-40));
+    if (data.crop) pushUndo({ type: "createCrop", crop: data.crop });
     showToast("Duplicated crop.");
   };
 
   const updateCrop = async (crop, patch, options = {}) => {
-    if (options.recordUndo !== false) setUndoStack((items) => [...items, { type: "updateCrop", before: crop }].slice(-40));
+    const after = { ...crop, ...patch };
     const data = await api("/api/crops/update", { method: "POST", body: JSON.stringify({ cropId: crop.id, ...patch }) });
     setState((s) => ({ ...s, queue: data.queue, crops: data.crops || s.crops }));
     if (data.crop?.id) setSelectedCropId(data.crop.id);
+    if (options.recordUndo !== false) pushUndo({ type: "updateCrop", before: crop, after: data.crop || after });
   };
 
   const removeCrop = async (crop, options = {}) => {
@@ -484,6 +501,7 @@ function App() {
     setState((s) => ({ ...s, queue: data.queue, crops: data.crops || [] }));
     setSelectedCropId("");
     setAttachments((items) => items.filter((item) => item.id !== crop.id));
+    if (options.recordUndo !== false) pushUndo({ type: "deleteCrop", crop });
   };
 
   const deleteCrop = (crop) => removeCrop(crop);
@@ -493,7 +511,8 @@ function App() {
     if (!action) return showToast("Nothing to undo.");
     setUndoStack((items) => items.slice(0, -1));
     if (action.type === "createCrop") {
-      await removeCrop(action.crop, { confirm: false });
+      await removeCrop(action.crop, { confirm: false, recordUndo: false });
+      setRedoStack((items) => [...items, action].slice(-40));
       showToast("Undid crop placement.");
       return;
     }
@@ -507,7 +526,45 @@ function App() {
         width: action.before.width,
         height: action.before.height,
       }, { recordUndo: false });
+      setRedoStack((items) => [...items, action].slice(-40));
       showToast("Undid crop edit.");
+      return;
+    }
+    if (action.type === "deleteCrop") {
+      const restored = await restoreCrop(action.crop);
+      setRedoStack((items) => [...items, { ...action, crop: restored || action.crop }].slice(-40));
+      showToast("Restored deleted crop.");
+    }
+  };
+
+  const redoLast = async () => {
+    const action = redoStack.at(-1);
+    if (!action) return showToast("Nothing to redo.");
+    setRedoStack((items) => items.slice(0, -1));
+    if (action.type === "createCrop") {
+      const restored = await restoreCrop(action.crop);
+      if (restored) setUndoStack((items) => [...items, { type: "createCrop", crop: restored }].slice(-40));
+      showToast("Redid crop placement.");
+      return;
+    }
+    if (action.type === "updateCrop") {
+      await updateCrop(action.before, {
+        label: action.after.label,
+        name: action.after.name,
+        type: action.after.type,
+        x: action.after.x,
+        y: action.after.y,
+        width: action.after.width,
+        height: action.after.height,
+      }, { recordUndo: false });
+      setUndoStack((items) => [...items, action].slice(-40));
+      showToast("Redid crop edit.");
+      return;
+    }
+    if (action.type === "deleteCrop") {
+      await removeCrop(action.crop, { confirm: false, recordUndo: false });
+      setUndoStack((items) => [...items, action].slice(-40));
+      showToast("Redid crop deletion.");
     }
   };
 
@@ -542,7 +599,13 @@ function App() {
       if (target?.closest?.("input, textarea, select, [contenteditable='true']")) return;
       if ((event.metaKey || event.ctrlKey) && !event.altKey && key === "z") {
         event.preventDefault();
-        undoLast().catch((error) => showToast(error.message));
+        if (event.shiftKey) redoLast().catch((error) => showToast(error.message));
+        else undoLast().catch((error) => showToast(error.message));
+        return;
+      }
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && key === "y") {
+        event.preventDefault();
+        redoLast().catch((error) => showToast(error.message));
         return;
       }
       if (event.metaKey || event.ctrlKey || event.altKey) return;
@@ -570,7 +633,7 @@ function App() {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedCrop?.id, selectedCrop?.x, selectedCrop?.y, state.queue, undoStack]);
+  }, [selectedCrop?.id, selectedCrop?.x, selectedCrop?.y, state.queue, undoStack, redoStack]);
 
   const sendChat = async (event) => {
     event?.preventDefault();
@@ -664,6 +727,10 @@ function App() {
               setState((s) => ({ ...s, queue: data.queue, crops: data.crops || s.crops }));
             }}
             onAttachPage={() => state.page && addAttachment({ type: "page", id: state.page.id, name: state.page.file_name })}
+            canUndo={undoStack.length > 0}
+            canRedo={redoStack.length > 0}
+            onUndo={() => undoLast().catch((error) => showToast(error.message))}
+            onRedo={() => redoLast().catch((error) => showToast(error.message))}
           />
           <div className="splitter" role="separator" aria-label="Resize workbench" onPointerDown={(event) => setPanelDrag({ kind: "workbench", startX: event.clientX, ...panelWidths })} />
           <Workbench
@@ -763,14 +830,14 @@ function App() {
 function Chrome({ mode, setMode, project, projectProgress, model, decisions, hasKey, keyInfo, onProject, onGuide, onModel, onSettings, onExport, onAccount }) {
   const usage = keyInfo?.usage ? `$${Number(keyInfo.usage).toFixed(2)} used` : hasKey ? "connected" : "offline";
   const projectStatus = projectProgress?.pages
-    ? `Final ${projectProgress.final}/${projectProgress.pages} · Drafted ${projectProgress.drafted + projectProgress.final}/${projectProgress.pages}`
+    ? `Untranslated ${projectProgress.untranslated} · Drafted ${projectProgress.drafted + projectProgress.inProgress} · Final ${projectProgress.final} · Typeset 0`
     : "";
   return (
     <header className="chrome">
       <div className="brand"><span className="dot"><Icon name="logo" size={18} /></span><span>MangaTranslator</span></div>
       <div className="divider" />
       <button className="project-name" title={project?.path || "No project"} aria-label="Open projects" onClick={onProject}><span>Project · </span><b>{project?.name || "No project"}</b><Icon name="chevronDown" size={12} /></button>
-      {projectStatus && <span className="project-progress">{projectStatus}</span>}
+      {projectStatus && <span className="project-progress" title={`${projectProgress.pages} pages · ${projectProgress.lines} lines · Reviewed pages are counted as final in this build`}>{projectStatus}</span>}
       <button className="guide-button" onClick={onGuide} aria-label="Open Project Guide"><Icon name="book" size={13} /><b>Project Guide</b><span>{decisions?.length || 0} rules</span></button>
       <div className="tabs" role="tablist" aria-label="App mode">
         <button aria-pressed={mode === "translation"} onClick={() => setMode("translation")}><Icon name="reading" size={13} /> Translation</button>
@@ -837,9 +904,11 @@ function PageProgress({ page, compact = false }) {
   );
 }
 
-function Viewer({ page, crops, selectedCropId, setSelectedCropId, tool, setTool, onCreateCrop, onUpdateCrop, onFiles, onQueueAll, onAttachPage }) {
+function Viewer({ page, crops, selectedCropId, setSelectedCropId, tool, setTool, onCreateCrop, onUpdateCrop, onFiles, onQueueAll, onAttachPage, canUndo, canRedo, onUndo, onRedo }) {
   const viewportRef = useRef(null);
   const imageRef = useRef(null);
+  const emptyFileRef = useRef(null);
+  const emptyFolderRef = useRef(null);
   const [drawing, setDrawing] = useState(null);
   const [panning, setPanning] = useState(null);
   const [dragActive, setDragActive] = useState(false);
@@ -944,8 +1013,15 @@ function Viewer({ page, crops, selectedCropId, setSelectedCropId, tool, setTool,
         {!page ? (
           <div className="empty-state">
             <Icon name="image" size={32} />
-            <h2>Import your first page</h2>
-            <p>Drop images, folders, ZIP, or CBZ files into the project. PDF support is queued into this importer.</p>
+            <h2>Import pages</h2>
+            <p>Drop images, folders, ZIP, or CBZ files here. CBR returns a clear extractor message; PDF rasterization is planned.</p>
+            <div className="empty-actions">
+              <button className="btn primary" onClick={() => emptyFileRef.current?.click()}><Icon name="plus" /> Add files</button>
+              <button className="btn ghost" onClick={() => emptyFolderRef.current?.click()}><Icon name="folder" /> Add folder</button>
+            </div>
+            <div className="format-row"><span>PNG</span><span>JPG</span><span>WEBP</span><span>ZIP</span><span>CBZ</span><span>CBR</span><span>PDF planned</span></div>
+            <input ref={emptyFileRef} hidden type="file" multiple accept="image/*,.zip,.cbz,.cbr,.pdf" onChange={(e) => onFiles([...e.target.files])} />
+            <input ref={emptyFolderRef} hidden type="file" multiple webkitdirectory="" onChange={(e) => onFiles([...e.target.files])} />
           </div>
         ) : (
           <div
@@ -984,7 +1060,14 @@ function Viewer({ page, crops, selectedCropId, setSelectedCropId, tool, setTool,
           </div>
         )}
       </div>
-      <div className="viewer-footer"><Icon name="check" className="success" /> Saved locally · {crops.length} crops · {crops.filter((c) => c.type === "speech").length} speech <span className="spacer" /><span className="kbd">V</span> Select <span className="kbd">C</span> Crop <span className="kbd">Shift Enter</span> Send</div>
+      <div className="viewer-footer">
+        <Icon name="check" className="success" /> Saved locally · {crops.length} crops · {crops.filter((c) => c.type === "speech").length} speech
+        <div className="history-controls">
+          <button className="btn icon sm ghost" disabled={!canUndo} onClick={onUndo} title="Undo crop edit" aria-label="Undo crop edit"><Icon name="chevronLeft" /></button>
+          <button className="btn icon sm ghost" disabled={!canRedo} onClick={onRedo} title="Redo crop edit" aria-label="Redo crop edit"><Icon name="chevronRight" /></button>
+        </div>
+        <span className="spacer" /><span className="kbd">V</span> Select <span className="kbd">C</span> Crop <span className="kbd">Shift Enter</span> Send
+      </div>
     </section>
   );
 }
@@ -1078,6 +1161,14 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
           <button className="btn icon sm ghost" aria-pressed={view === "card"} onClick={() => setView("card")} title="Card view" aria-label="Card view"><Icon name="grid" /></button>
         </div>
       </div>
+      {!page ? (
+        <div className="panel-empty">
+          <Icon name="image" size={24} />
+          <b>No page selected</b>
+          <span>Import pages or choose a thumbnail to start cropping and drafting lines.</span>
+        </div>
+      ) : (
+      <>
       <div className="filter-row">
         {[["all", "All", scratchpad.length], ["queue", "Queue", queue.length], ["draft", "Drafts", draftCount], ["final", "Final", finalCount]].map(([id, label, count]) => (
           <button key={id} className="btn sm ghost" aria-pressed={filter === id} onClick={() => setFilter(id)}>{label} <span>{count}</span></button>
@@ -1103,13 +1194,13 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
             );
           })}
           {visibleRows.map((row) => <button key={row.id} className="scratch-card" onClick={() => setSelectedEntryId(row.id)}><ScratchSummary row={row} /><p>{row.notes || "No notes yet."}</p></button>)}
-          {!crops.length && !visibleRows.length && <div className="quiet">Crops and scratchpad cards will appear here.</div>}
+          {!crops.length && !visibleRows.length && <div className="panel-empty small"><Icon name="rectangle" /><b>No crops or lines yet</b><span>Create crops on the page or add a scratchpad line.</span></div>}
         </div>
       ) : (
         <div className="workbench-body">
           <div className="line-list mt-scroll">
             {visibleRows.map((row) => <button key={row.id} className={classNames("line-row", selectedEntry?.id === row.id && "active")} onClick={() => setSelectedEntryId(row.id)}><ScratchSummary row={row} /></button>)}
-            {!visibleRows.length && <div className="quiet">Model first-pass lines will appear here automatically.</div>}
+            {!visibleRows.length && <div className="panel-empty small"><Icon name="queue" /><b>No scratchpad lines</b><span>Use + Line, send a first-pass translation to scratchpad, or select crops to build a queue.</span></div>}
           </div>
           <EntryEditor entry={selectedEntry} onSave={onSaveEntry} onDelete={onDeleteEntry} onAsk={onAskLine} />
         </div>
@@ -1142,6 +1233,8 @@ function Workbench({ page, crops, queue, scratchpad, selectedEntry, selectedCrop
         onDuplicate={onDuplicateCrop}
         onDelete={onDeleteCrop}
       />
+      </>
+      )}
     </aside>
   );
 }
@@ -1207,6 +1300,7 @@ function ScratchSummary({ row }) {
 
 function EntryEditor({ entry, onSave, onDelete, onAsk }) {
   const [draft, setDraft] = useState(entry || {});
+  const [saveStatus, setSaveStatus] = useState("saved");
   const pendingSaves = useRef(new Map());
   const waitForPendingSave = async (entryId) => {
     const pending = pendingSaves.current.get(entryId);
@@ -1217,25 +1311,43 @@ function EntryEditor({ entry, onSave, onDelete, onAsk }) {
     const entryId = entry.id;
     const next = { ...draft, ...patch, id: entryId };
     setDraft(next);
+    setSaveStatus("saving");
     const previous = pendingSaves.current.get(entryId) || Promise.resolve();
     const savePromise = previous.catch(() => {}).then(() => onSave(next));
     pendingSaves.current.set(entryId, savePromise);
     try {
       await savePromise;
+      setSaveStatus("saved");
     } finally {
       if (pendingSaves.current.get(entryId) === savePromise) pendingSaves.current.delete(entryId);
     }
   };
-  useEffect(() => setDraft(entry || {}), [entry?.id]);
-  if (!entry) return <div className="entry-editor quiet">Select or create a scratchpad line.</div>;
   const update = (patch) => setDraft((value) => ({ ...value, ...patch }));
-  const dirty = ["label", "type", "source", "draft", "final", "notes", "confirmed"].some((key) => String(draft[key] ?? "") !== String(entry[key] ?? ""));
+  const dirty = Boolean(entry) && ["label", "type", "source", "draft", "final", "notes", "confirmed"].some((key) => String(draft[key] ?? "") !== String(entry[key] ?? ""));
   const confirmed = Boolean(draft.confirmed);
+  useEffect(() => {
+    setDraft(entry || {});
+    setSaveStatus("saved");
+  }, [entry?.id]);
+  useEffect(() => {
+    if (!entry) return undefined;
+    if (!dirty) {
+      setSaveStatus("saved");
+      return undefined;
+    }
+    setSaveStatus("unsaved");
+    const timer = window.setTimeout(() => {
+      saveDraft().catch(() => setSaveStatus("unsaved"));
+    }, 900);
+    return () => window.clearTimeout(timer);
+  }, [draft, dirty, entry?.id]);
+  if (!entry) return <div className="entry-editor quiet">Select or create a scratchpad line.</div>;
   return (
     <form className="entry-editor mt-scroll" onSubmit={async (e) => { e.preventDefault(); await saveDraft({ confirmed: confirmed ? 0 : 1 }); }}>
       <div className="editor-head">
         <input value={draft.label || ""} onChange={(e) => update({ label: e.target.value, type: labelType(e.target.value) })} onBlur={() => dirty && saveDraft()} />
         <select value={draft.type || "speech"} onChange={(e) => saveDraft({ type: e.target.value })}><option value="speech">speech</option><option value="sfx">sfx</option><option value="narration">narration</option></select>
+        <span className={classNames("save-state", saveStatus)}>{saveStatus === "saving" ? "Saving" : dirty ? "Unsaved" : "Saved"}</span>
         <button type="button" className="btn icon sm ghost" onClick={() => onAsk(entry)} title="Ask about this line" aria-label="Ask about this line"><Icon name="chat" /></button>
         <button type="button" className="btn icon sm ghost" onClick={async () => { await waitForPendingSave(entry.id); await onDelete(entry); }} title="Delete line" aria-label="Delete line"><Icon name="trash" /></button>
       </div>
@@ -1326,6 +1438,13 @@ function ChatPanel({ messages, models, chatSessions, activeChatSessionId, attach
         )) : <small>No page or crop attached</small>}
         <button className="pill guide-chip" onClick={onGuide} title={guideSummary(decisions)}><Icon name="book" size={11} /> {guideShortSummary(decisions)}</button>
       </div>
+      {queue.length > 0 && (
+        <div className="queue-send-strip">
+          <span>Queue</span>
+          <div>{queue.map((crop, index) => <button key={crop.id} className={classNames("pill", attachments.some((item) => item.id === crop.id) && "active")} onClick={() => setAttachments(attachments.filter((item) => item.id !== crop.id))}>{index + 1}. {crop.label || crop.name}</button>)}</div>
+          <button className="btn sm ghost" onClick={onAttachQueue}><Icon name="queue" /> Attach queue</button>
+        </div>
+      )}
       <div className="message-list mt-scroll">
         {messages.map((message, index) => <Message key={message.id || index} message={message} models={models} onImportTranslation={onImportTranslation} onUndoTranslationImport={onUndoTranslationImport} />)}
         {!messages.length && (
@@ -1370,13 +1489,17 @@ function Message({ message, models, onImportTranslation, onUndoTranslationImport
   const isError = String(message.role).includes("error");
   const isAssistant = String(message.role).startsWith("assistant");
   const roleLabel = isUser ? "user" : "assistant";
-  const modelName = isAssistant && message.model ? modelLabelForId(message.model, models) : "";
+  const modelObject = isAssistant && message.model ? models.find((item) => item.id === message.model) || { id: message.model } : null;
+  const modelName = modelObject ? modelLabel(modelObject) : "";
+  const provider = modelObject?.id?.includes("/") ? modelObject.id.split("/")[0] : "";
+  const modalities = [...(modelObject?.architecture?.input_modalities || []), modelObject?.architecture?.modality || ""].join(" ").toLowerCase();
+  const isVision = /image|vision|multimodal/.test(modalities) || String(modelObject?.id || "").includes("gemini");
   const bodyText = String(message.content || "").trim();
   const hasBody = Boolean(bodyText && !(isUser && bodyText === "..." && attachments.length));
   const importedCount = structuredEntries.filter((entry) => entry.scratchpad_entry_id).length;
   return (
     <article className={classNames("message", isUser ? "user" : "assistant", isError && "error")}>
-      <div className="message-meta"><span>{roleLabel}</span>{modelName && <b title={message.model}>{modelName}</b>}{message.created_at && <time>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}{attachments.length > 0 && <b>{attachments.length} attachment{attachments.length === 1 ? "" : "s"}</b>}</div>
+      <div className="message-meta"><span>{roleLabel}</span>{provider && <b className="provider-badge">{provider}</b>}{modelName && <b title={`${message.model}${modelObject?.pricing ? ` · ${formatPricing(modelObject.pricing)}` : ""}`}>{modelName}</b>}{isVision && <b className="vision-badge">vision</b>}{message.created_at && <time>{new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}{attachments.length > 0 && <b>{attachments.length} attachment{attachments.length === 1 ? "" : "s"}</b>}</div>
       {attachments.length > 0 && <div className="message-attachments">{attachments.map((a) => <span key={`${a.type}:${a.id}`}>{a.type}: {a.name || a.id}</span>)}</div>}
       {isAssistant && structuredEntries.length > 0 && (
         <div className="translation-actions">
@@ -1421,60 +1544,6 @@ function MarkdownBubble({ content }) {
       </Suspense>
     </div>
   );
-}
-
-function parseAssistantContent(content = "") {
-  const lines = String(content).split(/\r?\n/);
-  const blocks = [];
-  let current = null;
-  let activeField = "";
-  let remainderStart = lines.length;
-  const commit = () => {
-    if (current && (current.source || current.draft || current.notes || current.type)) blocks.push(current);
-  };
-  for (let index = 0; index < lines.length; index += 1) {
-    const rawLine = lines[index];
-    const line = rawLine.trim();
-    const match = line.match(/^(?:[-*]\s*)?(?:\*\*)?Label(?:\*\*)?\s*:\s*(SFX\d+|S\d+|N\d+)/i);
-    if (match) {
-      commit();
-      current = { label: match[1].toUpperCase(), type: "", source: "", draft: "", notes: "" };
-      activeField = "";
-      continue;
-    }
-    if (!current) continue;
-    const field = line.match(/^(?:[-*]\s*)?(?:\*\*)?(Type|Source|Draft|Notes?)(?:\*\*)?\s*:\s*(.*)$/i);
-    if (!field) {
-      if (!line) continue;
-      if (activeField && /^\s+/.test(rawLine)) {
-        current[activeField] = `${current[activeField]} ${stripMarkdown(line)}`.trim();
-        continue;
-      }
-      remainderStart = index;
-      break;
-    }
-    const key = field[1].toLowerCase().replace(/^note$/, "notes");
-    current[key] = stripMarkdown(field[2]);
-    activeField = key;
-  }
-  commit();
-  return {
-    blocks,
-    remainder: lines.slice(remainderStart).join("\n").trim(),
-  };
-}
-
-function parseAssistantBlocks(content = "") {
-  return parseAssistantContent(content).blocks;
-}
-
-function stripMarkdown(value = "") {
-  return String(value)
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/__([^_]+)__/g, "$1")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/^[-*]\s+/, "")
-    .trim();
 }
 
 function Onboarding({ state, onClose, onRefresh, showToast }) {
@@ -1576,9 +1645,23 @@ function ModelPicker({ models, selected, query, setQuery, visionOnly, setVisionO
   }).slice(0, 120);
   return (
     <Modal wide title="Choose model" onClose={onClose}>
-      <div className="model-tools"><input placeholder="Search models, vendors, slugs..." value={query} onChange={(e) => setQuery(e.target.value)} /><button className="btn" aria-pressed={visionOnly} onClick={() => setVisionOnly(!visionOnly)}><Icon name="image" /> Vision only</button></div>
+      <div className="model-tools"><input placeholder="Search models, vendors, slugs..." value={query} onChange={(e) => setQuery(e.target.value)} /><span>{filtered.length} available</span><button className="btn" aria-pressed={visionOnly} onClick={() => setVisionOnly(!visionOnly)}><Icon name="image" /> Vision only</button></div>
       <div className="model-list mt-scroll">
-        {filtered.map((model) => <button key={model.id} className={selected === model.id ? "active" : ""} onClick={() => onSelect(model.id)}><b>{modelLabel(model)}</b><code>{model.id}</code><span>{compactNumber(model.context_length)} ctx · {formatPricing(model.pricing)}</span>{selected === model.id && <Icon name="check" />}</button>)}
+        {filtered.map((model) => {
+          const provider = model.id?.split("/")?.[0] || "model";
+          const modalities = [...(model.architecture?.input_modalities || []), model.architecture?.modality || "", model.description || ""].join(" ").toLowerCase();
+          const vision = /image|vision|multimodal/.test(modalities) || model.id.includes("gemini");
+          return (
+            <button key={model.id} className={selected === model.id ? "active" : ""} onClick={() => onSelect(model.id)}>
+              <span className="provider-avatar">{provider.slice(0, 2).toUpperCase()}</span>
+              <b>{modelLabel(model)}</b>
+              <span className="model-badges">{vision && <i>vision</i>}{model.id === DEFAULT_MODEL && <i>default</i>}{selected === model.id && <i>selected</i>}</span>
+              <code>{model.id}</code>
+              <span className="model-pricing">{compactNumber(model.context_length)} ctx · {formatPricing(model.pricing)}</span>
+              {selected === model.id && <Icon name="check" />}
+            </button>
+          );
+        })}
       </div>
     </Modal>
   );
@@ -1630,6 +1713,7 @@ function AccountModal({ state, onClose, onRefresh, showToast }) {
       setBusy(false);
     }
   };
+
   return (
     <Modal title="OpenRouter account" onClose={onClose}>
       <p>{state.hasOpenRouterKey ? "OpenRouter is connected locally." : "Connect OpenRouter, paste an API key, or reuse the legacy local key if available."}</p>
@@ -1704,7 +1788,8 @@ function DecisionsModal({ project, decisions, onClose, onSave }) {
 }
 
 function TypesettingPlaceholder() {
-  return <main className="typesetting"><Icon name="type" size={32} /><h1>Typesetting</h1><p>Place final translations back onto the page with text-clearing, balloon fills, font rules, flattened PNG export, and layered output. Queued after translation mode feels excellent.</p><div><b>Shipping order</b><span>Image cleaning</span><span>Text placement linked to finals</span><span>Font management</span><span>Layered export</span></div></main>;
+  const steps = [["Queued", "Image cleaning"], ["Next", "Text placement linked to finals"], ["Next", "Font management"], ["Later", "Layered export"]];
+  return <main className="typesetting"><div className="typesetting-mark"><Icon name="type" size={32} /></div><h1>Typesetting</h1><p>Place final translations back onto the page with text clearing, balloon fills, font rules, flattened PNG export, and layered output.</p><div><b>Shipping order</b>{steps.map(([status, label]) => <span key={label}><i>{status}</i>{label}</span>)}</div></main>;
 }
 
 function AppDialog({ dialog }) {

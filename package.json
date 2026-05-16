@@ -10,6 +10,8 @@
     "start": "node --no-warnings server/index.cjs",
     "build": "vite build",
     "preview": "vite preview --host 127.0.0.1 --port 4173",
+    "test:parsers": "node scripts/parser-test.mjs",
+    "test:ui": "node scripts/playwright-flow.cjs",
     "test:smoke": "node scripts/smoke-test.cjs"
   },
   "dependencies": {
