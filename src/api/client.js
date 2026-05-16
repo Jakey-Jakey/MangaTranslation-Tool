@@ -4,8 +4,18 @@ export async function api(path, options = {}) {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
   const text = await response.text();
-  const data = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(data.error || response.statusText);
+  let data = {};
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      data = text;
+    }
+  }
+  if (!response.ok) {
+    const error = data && typeof data === "object" ? data.error : "";
+    throw new Error(error || text || response.statusText || `Request failed with status ${response.status}`);
+  }
   return data;
 }
 

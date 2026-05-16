@@ -1518,7 +1518,7 @@ function Message({ message, models, onImportTranslation, onUndoTranslationImport
 
 function MessageBody({ content, isAssistant }) {
   const { blocks, remainder } = isAssistant ? parseAssistantContent(content) : { blocks: [], remainder: "" };
-  if (blocks.length >= 2) {
+  if (blocks.length > 0) {
     return (
       <div className="assistant-blocks">
         {blocks.map((block, index) => (
